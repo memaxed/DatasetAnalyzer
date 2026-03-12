@@ -35,13 +35,7 @@ if(MSVC)
     )
 else()
     set_source_files_properties(${BIQTIRIS_SOURCES}
-        PROPERTIES COMPILE_FLAGS "-Wno-reorder -Wno-unused-variable -Wno-unused-parameter"
-    )
-endif()
-
-if(NOT WIN32)
-    set_source_files_properties(${BIQTIRIS_SOURCES}
-        PROPERTIES COMPILE_FLAGS "-fPIC"
+        PROPERTIES COMPILE_FLAGS "-fPIC -Wno-reorder -Wno-unused-variable -Wno-unused-parameter"
     )
 endif()
 
