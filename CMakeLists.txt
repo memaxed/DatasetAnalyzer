@@ -33,6 +33,10 @@ if(MSVC)
     set_source_files_properties(${BIQTIRIS_SOURCES}
         PROPERTIES COMPILE_FLAGS "/wd4244"
     )
+else()
+    set_source_files_properties(${BIQTIRIS_SOURCES}
+        PROPERTIES COMPILE_FLAGS "-Wno-reorder -Wno-unused-variable -Wno-unused-parameter"
+    )
 endif()
 
 if(NOT WIN32)
