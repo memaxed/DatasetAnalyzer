@@ -12,23 +12,23 @@
 #define BIQTIRIS_H
 
 #include "ImageOps.h"
-#include "ProviderInterface.h"
-#include "opencv2/highgui/highgui.hpp"
-#include <json/json.h>
-#include <json/value.h>
+#include "DetectedIris.h"
+#include "opencv2/core.hpp"
+#include <cstdint>
 #include <map>
 #include <string>
-#include <utility>
 
-class BIQTIris : public Provider {
+class BIQTIris {
 
- private:
+private:
   MFilter mfo;
 
- public:
+public:
   BIQTIris();
 
-  Provider::EvaluationResult evaluate(const std::string &file) override;
+  int32_t assessQuality(const cv::Mat &image,
+                        const DetectedIris &detectedIris,
+                        std::map<std::string, float> *qualityScores);
 };
 
 #endif

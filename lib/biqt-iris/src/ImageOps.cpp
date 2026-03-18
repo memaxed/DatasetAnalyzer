@@ -40,7 +40,7 @@ MFilter::MFilter()
 //  Updates for 01 March 2023 minor version
 //  Increased max_r_trial from 42 to 54 to allow finding rough iris diameters up to 432 pixels
 //  Decrease min_r_trial from 28 to 20 to allow finding rough iris diameters down to 80 pixels
-  
+
   cos = new int[101];
 
   isgs_vals_ = new int[256];
@@ -76,11 +76,11 @@ void MFilter::Initialize() {
   }
 }
 
+// Original GetQualityFromImageFrame — runs internal iris/pupil detection
 int MFilter::GetQualityFromImageFrame(const uint8_t *frame_bytes, int width, int height) {
   int overall_quality = 0;
 
   try {
-    // Create all the image-based pointers (using width / height information)
     CreateImagePointers(width, height);
 
     FindIris(frame_bytes, width, height);
@@ -118,7 +118,96 @@ int MFilter::GetQualityFromImageFrame(const uint8_t *frame_bytes, int width, int
     std::cerr << "exception caught: " << ex.what() << std::endl;
   }
 
-  // Delete all the image-based pointers (using width / height information)
+  DeleteImagePointers(width, height);
+
+  return overall_quality;
+}
+
+// Overload — skips detection, uses externally supplied coordinates
+int MFilter::GetQualityFromImageFrame(const uint8_t *frame_bytes, int width, int height,
+                                      int iris_cx, int iris_cy, int iris_r,
+                                      int pupil_cx, int pupil_cy, int pupil_r) {
+  int overall_quality = 0;
+
+  try {
+    CreateImagePointers(width, height);
+
+    // Populate raw_bin_ from the flat frame buffer — required by Defocus,
+    // Contrast and FindOcclusions which operate on the 2D raw_bin_ array
+    RawByteFrameToTwoDimArray(frame_bytes, raw_bin_, width, height);
+
+    // Build edge maps so that FindOcclusions has valid vert_edge_bin_ and
+    // edge_raw_bin_ data (same steps FindIris performs internally)
+    DownSize(raw_bin_, width, height, 4, ds_raw_bin_);
+    EdgeMap(ds_raw_bin_, width / 4, height / 4);
+    GetVertEdges(ds_raw_bin_, width / 4, height / 4);
+
+    // Inject externally detected iris geometry
+    iris_center_x_ = iris_cx;
+    iris_center_y_ = iris_cy;
+    iris_radius_ = iris_r;
+
+    // Inject externally detected pupil geometry into all backing fields
+    pupil_cx_ = pupil_cx;
+    pupil_cy_ = pupil_cy;
+    pupil_rad_ = pupil_r;
+    pupil_d_ = pupil_r * 2;
+    pupil_center_x_ = pupil_cx;
+    pupil_center_y_ = pupil_cy;
+    pupil_radius_ = pupil_r;
+
+    iris_pupil_diameter_ratio_ = (iris_r > 0)
+        ? static_cast<double>(pupil_r) / static_cast<double>(iris_r)
+        : 0.0;
+
+    Defocus(raw_bin_, width, height);
+    Contrast(raw_bin_, width, height);
+
+    CheckMargins(width, height, iris_center_x_, iris_center_y_, iris_radius_ * 2);
+    FindOcclusions(raw_bin_,
+                   width,
+                   height,
+                   iris_center_x_,
+                   iris_center_y_,
+                   iris_radius_,
+                   pupil_cx_,
+                   pupil_cy_,
+                   pupil_rad_);
+
+    // Compute raw metrics that normally require the detector pipeline
+    // CalcIrisScleraGS uses width*4/height*4 to match the scale used by
+    // FindFineIris (same trick: real pixel data in raw_bin_, but bounds
+    // checked against the upscaled dimensions so trig_vals_ offsets work)
+    CalcIrisScleraGS(width * 4, height * 4);
+    CalcIrisPupilGS(width, height);
+
+    // Replicate exact FindFinePupil call from the original pipeline
+    // max_p_r_trial_ must match what FindPupilCenter sets:
+    // iris_diameter passed to FindPupilCenter = iris_radius_ * 2 / 4  (downscaled)
+    // max_p_r_trial_ = iris_diameter / 2 * 6 / 10
+    max_p_r_trial_ = (iris_radius_ * 2 / 4) / 2 * 6 / 10;
+    FindFinePupil(pupil_cx_, pupil_cy_, width, height);
+
+    ISOContrast(frame_bytes, width, height);
+    ISOPupilBoundaryCircularity(dimless_r_, 17, sizeof(dimless_r_) / sizeof(dimless_r_[0]));
+    ISOGreyscaleUtilization(frame_bytes, width, height);
+    ISOIrisPupilConcentricity();
+    ISOMarginAdequacy(width, height);
+    ISOSharpness(frame_bytes, width, height);
+
+    double iris_vis = usable_iris_area_percent_ / 100.0;
+    overall_quality = CalcOverallQuality(contrast_score_, defocus_score_, (int) isgs_diff_mean_avg_,
+                                         overall_margin_, iris_radius_ * 2, iris_vis,
+                                         iris_pupil_gs_diff_, iris_pupil_diameter_ratio_);
+
+    iso_overall_quality_ = Calc_ISO_Overall_Quality(n_iso_sharpness_value_, n_iso_greyscale_value_,
+                                                    n_iso_ip_concentricity_value_, n_iso_iris_sclera_contrast_value_,
+                                                    n_iso_margin_adequacy_value_, n_iso_iris_pupil_contrast_value_,
+                                                    n_iso_iris_pupil_ratio_value_);
+  } catch (std::exception &ex) {
+    std::cerr << "exception caught: " << ex.what() << std::endl;
+  }
+
   DeleteImagePointers(width, height);
 
   return overall_quality;
@@ -905,724 +994,6 @@ void MFilter::ISOSharpness(const uint8_t *raw_img, const int width, const int he
   }
 }
 
-void MFilter::FindIris(const uint8_t *frame_bytes, int width, int height) {
-  uint8_t **raw_img = new uint8_t *[width];
-  for (int i = 0; i < width; i++) {
-    raw_img[i] = new uint8_t[height];
-  }
-
-  RawByteFrameToTwoDimArray(frame_bytes, raw_img, width, height);
-  FindIris(raw_img, width, height);
-
-  for (int i = 0; i < width; i++) {
-    delete[] raw_img[i];
-  }
-
-  delete[] raw_img;
-}
-
-void MFilter::FindIris(uint8_t **raw_bytes, int width, int height) {
-  for (int i = 0; i < width; i++) {
-    for (int j = 0; j < height; j++) {
-      raw_bin_[i][j] = raw_bytes[i][j];
-    }
-  }
-
-  int ds_factor = 4;
-  int ds_width = width / ds_factor;
-  int ds_height = height / ds_factor;
-
-  DownSize(raw_bytes, width, height, ds_factor, ds_raw_bin_);
-  EdgeMap(ds_raw_bin_, ds_width, ds_height);
-  GetVertEdges(ds_raw_bin_, ds_width, ds_height);
-  FindIrisCenter(edge_val_bin_, edge_val_bin_, ds_width, ds_height, raw_bin_);
-}
-
-void MFilter::FindIrisCenter(int **l_edge_vals, int **r_edge_vals, int width,
-                             int height, uint8_t **raw_bytes) {
-  // Version 2.2.1 Change ... lower_seg_trial_ and upper_seg_trial_ are globals...
-  //                          Reset these values due to conflict with Fine
-  //                          Iris finding routine.
-  lower_seg_trial_ = 47;
-  upper_seg_trial_ = 40;
-
-  int max_seg_trial = upper_seg_trial_;
-  if (lower_seg_trial_ > max_seg_trial) {
-    max_seg_trial = lower_seg_trial_;
-  }
-
-  Point iris_center_pt[224];
-  int ctr = 0;
-  for (int r = 2; r < 17; r += 2) {
-    for (int j = 0; j < 61; j += 10) {
-      iris_center_pt[ctr].X = trig_vals_[j][r][0];
-      iris_center_pt[ctr].Y = trig_vals_[j][r][1];
-
-      iris_center_pt[ctr + 56].X = trig_vals_[j][r][0];
-      iris_center_pt[ctr + 56].Y = -trig_vals_[j][r][1];
-      iris_center_pt[ctr + 112].X = -trig_vals_[j][r][0];
-      iris_center_pt[ctr + 112].Y = trig_vals_[j][r][1];
-      iris_center_pt[ctr + 168].X = -trig_vals_[j][r][0];
-      iris_center_pt[ctr + 168].Y = -trig_vals_[j][r][1];
-      ctr++;
-    }
-  }
-
-  int best_response = 0;
-  for (int r = min_r_trial_; r < max_r_trial_; r++, r++) {
-    for (int i_x = width * 1 / 10; i_x < width * 9 / 10; i_x++, i_x++) {
-      for (int i_y = height * 1 / 10; i_y < height * 9 / 10; i_y++, i_y++) {
-// March 2023 minor revisions
-// Increased search space for center of iris to within 10% of the left, right, top, and bottom of the image
-        // Version 2.2.1 change initialize dark_iris_center to zero
-        int dark_iris_center = 0;
-        int trial_response = 0;
-        int left_edge_response = 0;
-        int right_edge_response = 0;
-        int vert_edge_response = 0;
-        int pt_dark_val = 0;
-        int trial_x = 0;
-        int trial_y = 0;
-
-        for (int i_ctr = 0; i_ctr < 224; i_ctr++) {
-          trial_x = i_x + iris_center_pt[i_ctr].X;
-          trial_y = i_y - iris_center_pt[i_ctr].Y;
-
-          if (trial_x > 0 && trial_x < width && trial_y < height && trial_y > 0) {
-            pt_dark_val = (int) ds_raw_bin_[trial_x][trial_y];
-            pt_dark_val = (55 - pt_dark_val);
-
-            if (pt_dark_val < 0) {
-              pt_dark_val = 0;
-            }
-            dark_iris_center += pt_dark_val;
-          }
-        }
-        for (int j_x = 0; j_x < max_seg_trial; j_x++) {
-          int r_x = i_x + trig_vals_[j_x][r][0];
-          int u_y = i_y - trig_vals_[j_x][r][1];
-          int l_x = i_x - trig_vals_[j_x][r][0];
-          int l_y = i_y + trig_vals_[j_x][r][1];
-
-          if (r_x + 4 < width - 1 && r_x - 2 >= 0) {
-            if (u_y >= 4 && j_x < upper_seg_trial_) {
-              right_edge_response += r_edge_vals[r_x][u_y];
-              vert_edge_response += vert_edge_[r_x][u_y];
-              right_edge_response += edge_val_bin_[r_x - 1][u_y];
-              vert_edge_response += vert_edge_[r_x - 1][u_y];
-              right_edge_response += edge_val_bin_[r_x + 1][u_y];
-              vert_edge_response += vert_edge_[r_x + 1][u_y];
-            }
-            if (l_y < height - 3 && j_x < lower_seg_trial_) {
-              right_edge_response += edge_val_bin_[r_x][l_y];
-              vert_edge_response += vert_edge_[r_x][l_y];
-              right_edge_response += edge_val_bin_[r_x - 1][l_y];
-              vert_edge_response += vert_edge_[r_x - 1][l_y];
-              right_edge_response += edge_val_bin_[r_x + 1][l_y];
-              vert_edge_response += vert_edge_[r_x + 1][l_y];
-            }
-          }
-
-          if (l_x - 2 >= 0 && r_x + 4 < width - 1) {
-            if (u_y >= 4 && j_x < upper_seg_trial_) {
-              left_edge_response += l_edge_vals[l_x][u_y];
-              vert_edge_response += vert_edge_[l_x][u_y];
-              left_edge_response += edge_val_bin_[l_x - 1][u_y];
-              vert_edge_response += vert_edge_[l_x - 1][u_y];
-              left_edge_response += edge_val_bin_[l_x + 1][u_y];
-              vert_edge_response += vert_edge_[l_x + 1][u_y];
-            }
-            if (l_y < height - 1 && j_x < lower_seg_trial_) {
-              left_edge_response += edge_val_bin_[l_x][l_y];
-              vert_edge_response += vert_edge_[l_x][l_y];
-              left_edge_response += edge_val_bin_[l_x - 1][l_y];
-              vert_edge_response += vert_edge_[l_x - 1][l_y];
-              left_edge_response += edge_val_bin_[l_x + 1][l_y];
-              vert_edge_response += vert_edge_[l_x + 1][l_y];
-            }
-          }
-        }
-
-        dark_iris_center = dark_iris_center * 105 / 10;
-        vert_edge_response = vert_edge_response * 3 / 10;
-        trial_response =
-            left_edge_response * 15 / 10 + right_edge_response * 15 / 10 + vert_edge_response + dark_iris_center;
-
-        if (trial_response > best_response) {
-          best_response = trial_response;
-          iris_center_x_ = i_x * 4;
-          iris_center_y_ = i_y * 4;
-          iris_radius_ = r * 4;
-        }
-      }
-    }
-  }
-  FindFineIris(raw_bin_, width * 4, height * 4, iris_center_x_, iris_center_y_, iris_radius_ * 2);
-}
-
-void MFilter::FindFineIris(uint8_t **raw_bytes, int width, int height, int rough_iris_center_x,
-                           int rough_iris_center_y, int rough_iris_diameter) {
-  lower_seg_trial_ = 40;
-  upper_seg_trial_ = 30;
-
-  int min_iris_center_x_fine = rough_iris_center_x - 4;
-  int max_iris_center_x_fine = rough_iris_center_x + 4;
-  int min_iris_center_y_fine = rough_iris_center_y - 4;
-  int max_iris_center_y_fine = rough_iris_center_y + 4;
-  int min_radius_fine = rough_iris_diameter / 2 - 4;
-  int max_radius_fine = rough_iris_diameter / 2 + 4;
-  if (max_radius_fine > max_radius_) {
-    max_radius_fine = max_radius_;
-  }
-
-  Point tan_pts[33];
-  int best_response = 0;
-  for (int r = min_radius_fine; r < max_radius_fine; r++) {
-    for (int i_x = min_iris_center_x_fine; i_x < max_iris_center_x_fine; i_x++) {
-      for (int i_y = min_iris_center_y_fine; i_y < max_iris_center_y_fine; i_y++) {
-        int right_edge_points_used = 0;
-        int left_edge_points_used = 0;
-        int trial_response = 0;
-        int left_edge_response = 0;
-        int right_edge_response = 0;
-
-        for (int j_x = 0; j_x < lower_seg_trial_; j_x += 2) {
-          int r_x = i_x + trig_vals_[j_x][r + 16][0];
-          int u_y = i_y - trig_vals_[j_x][r + 16][1];
-          int l_x = i_x - trig_vals_[j_x][r + 16][0];
-          int l_y = i_y + trig_vals_[j_x][r + 16][1];
-
-          int w_f = 1;
-          if (r_x < width && l_x >= 0) {
-            if (u_y >= 0 && j_x < upper_seg_trial_) {
-              int point_response = 0;
-
-              for (int r_ctr = 0; r_ctr < 16; r_ctr++, r_ctr++) {
-                w_f = 4 - (r_ctr / 4);
-                point_response += w_f *
-                    ((int) raw_bytes[i_x + trig_vals_[j_x][r + r_ctr][0]][i_y - trig_vals_[j_x][r + r_ctr][1]] -
-                        (int) raw_bytes[i_x + trig_vals_[j_x][r - r_ctr][0]][i_y - trig_vals_[j_x][r - r_ctr][1]]);
-              }
-              if (point_response < 0) {
-                point_response = -point_response;
-              }
-              if (point_response > max_point_response_) {
-                point_response = max_point_response_;
-              }
-
-              right_edge_response += point_response;
-              right_edge_points_used++;
-            }
-            if (l_y < width && j_x < lower_seg_trial_) {
-              int point_response = 0;
-
-              for (int r_ctr = 0; r_ctr < 16; r_ctr++) {
-                w_f = 4 - (r_ctr / 4);
-                point_response += w_f *
-                    ((int) raw_bytes[i_x + trig_vals_[j_x][r + r_ctr][0]][i_y + trig_vals_[j_x][r + r_ctr][1]] -
-                        (int) raw_bytes[i_x + trig_vals_[j_x][r - r_ctr][0]][i_y + trig_vals_[j_x][r - r_ctr][1]]);
-              }
-              if (point_response < 0) {
-                point_response = -point_response;
-              }
-              if (point_response > max_point_response_) {
-                point_response = max_point_response_;
-              }
-
-              right_edge_response += point_response;
-              right_edge_points_used++;
-            }
-          }
-          if (l_x >= 0 && r_x <= width) {
-            if (u_y >= 0 && j_x < upper_seg_trial_) {
-              int point_response = 0;
-
-              for (int r_ctr = 0; r_ctr < 16; r_ctr++) {
-                w_f = 4 - (r_ctr / 4);
-                point_response += w_f *
-                    ((int) raw_bytes[i_x - trig_vals_[j_x][r + r_ctr][0]][i_y - trig_vals_[j_x][r + r_ctr][1]] -
-                        (int) raw_bytes[i_x - trig_vals_[j_x][r - r_ctr][0]][i_y - trig_vals_[j_x][r - r_ctr][1]]);
-              }
-              if (point_response < 0) {
-                point_response = -point_response;
-              }
-              if (point_response > max_point_response_) {
-                point_response = max_point_response_;
-              }
-
-              left_edge_response += point_response;
-              left_edge_points_used++;
-            }
-            if (l_y < height - 1 && j_x < lower_seg_trial_) {
-              int point_response = 0;
-
-              for (int r_ctr = 0; r_ctr < 16; r_ctr++) {
-                w_f = 4 - (r_ctr / 4);
-                point_response += w_f *
-                    ((int) raw_bytes[i_x - trig_vals_[j_x][r + r_ctr][0]][i_y + trig_vals_[j_x][r + r_ctr][1]] -
-                        (int) raw_bytes[i_x - trig_vals_[j_x][r - r_ctr][0]][i_y + trig_vals_[j_x][r - r_ctr][1]]);
-              }
-              if (point_response < 0) {
-                point_response = -point_response;
-              }
-              if (point_response > max_point_response_) {
-                point_response = max_point_response_;
-              }
-
-              left_edge_response += point_response;
-              left_edge_points_used++;
-            }
-          }
-        }
-        trial_response = left_edge_response + right_edge_response;
-
-        if (trial_response > best_response) {
-          best_response = trial_response;
-          iris_center_x_ = i_x;
-          iris_center_y_ = i_y;
-          iris_radius_ = r;
-        }
-      }
-    }
-  }
-
-  int i_c_x = iris_center_x_;
-  int i_c_y = iris_center_y_;
-  int i_radius = iris_radius_;
-  n_iso_iris_diameter_value_ = 1.0;
-  if (iris_radius_ < 25) {
-    n_iso_iris_diameter_value_ = 0.0;
-  }
-  if (iris_radius_ > max_radius_ - 16) {
-    n_iso_iris_diameter_value_ = 0.0;
-    throw new std::out_of_range("Iris Radius exceeds max allowable");
-  }
-  if (iris_radius_ < 17) {
-    n_iso_iris_diameter_value_ = 0.0;
-    throw new std::out_of_range("Invalid Iris Diameter value");
-  }
-
-  for (int j = 0; j < max_segs_; j++) {
-    for (int r_ctr = 0; r_ctr < 33; r_ctr++) {
-      tan_pts[r_ctr].X = i_c_x + trig_vals_[j][i_radius + r_ctr - 16][0];
-      tan_pts[r_ctr].Y = i_c_y - trig_vals_[j][i_radius + r_ctr - 16][1];
-    }
-
-    int point_response = 0;
-    for (int r_ctr = 1; r_ctr < 16; r_ctr++) {
-      if (tan_pts[16 + r_ctr].X > 0 && tan_pts[16 + r_ctr].X < width && tan_pts[16 + r_ctr].Y > 0
-          && tan_pts[16 + r_ctr].Y < height) {
-        int outer_point_val = (int) raw_bytes[tan_pts[16 + r_ctr].X][tan_pts[16 + r_ctr].Y];
-        int inner_point_val = (int) raw_bytes[tan_pts[16 - r_ctr].X][tan_pts[16 - r_ctr].Y];
-
-        // Version 2.2.1 (Change to limit effects of single differences)
-        int response = outer_point_val - inner_point_val;
-        if (response > 75) {
-          response = 75;
-        }
-
-        point_response = point_response + response;
-      } else {
-        point_response = 0;
-      }
-    }
-    isgs_vals_[j] = point_response;
-  }
-
-  int isgs_total = 0;
-  int pts_used = 0;
-  for (int j_ctr = 0; j_ctr < 40; j_ctr++) {
-
-    isgs_total = isgs_total + isgs_vals_[255 - j_ctr];
-    pts_used++;
-    isgs_total = isgs_total + isgs_vals_[128 + j_ctr];
-    pts_used++;
-  }
-  for (int j_ctr = 0; j_ctr < 20; j_ctr++) {
-    isgs_total = isgs_total + isgs_vals_[j_ctr];
-    pts_used++;
-    isgs_total = isgs_total + isgs_vals_[127 - j_ctr];
-    pts_used++;
-  }
-
-  isgs_diff_mean_avg_ = isgs_total / (pts_used * 15);
-  if (isgs_diff_mean_avg_< 0) {
-      isgs_diff_mean_avg_ = 0;
-  }
-}
-
-void MFilter::FindPupilCenter(int **edge_v, int width, int height, int iris_center_x,
-                              int iris_center_y, int iris_diameter) {
-  // Note that Find Pupil Center operates on a downsized ( 1/4 ) size edge image.
-  // The iris_center_x and iris_center_y are already downscaled from full image coordinates
-  // Modified 2022_04_14 to set default pupil center location to iris center location
-  pupil_cx_ = iris_center_x * 4;
-  pupil_cy_ = iris_center_y * 4;
-  //default - Full scale default radius of 20 pixels
-  pupil_rad_ = 5 * 4;
-  //default - Full scale pupil diameter of 40 pixels
-  pupil_d_ = pupil_rad_ * 2;
-  // Only used if the trials based upon iris location fail to produce any values
-  // End modification
-  try {
-    // Modified 2022_04_14 to use the iris_diameter passed to the function instead of a global value
-
-    // Rough pupil finder uses the downscaled (1/4) edge image
-    // iris_diameter is the downscaled iris diameter passed to the rough pupil finding routine
-    // Limit the possible pupil radius to 60% of the iris diameter
-    max_p_r_trial_ = iris_diameter / 2 * 6 / 10;
-
-    // only use 55 angular segments of 256/4 (64) for each side of the pupil
-    p_upper_seg_trial_ = 55;
-    p_lower_seg_trial_ = 55;
-    int p_max_seg_trial = p_upper_seg_trial_;
-    if (p_lower_seg_trial_ > p_max_seg_trial) {
-      p_max_seg_trial = p_lower_seg_trial_;
-    }
-
-    // define the region of interest in the pupil search to be at least 10% of the pupil diameter from the image margins
-    int iris_reduced = iris_diameter / 10;
-
-    int roi_top = iris_center_y - iris_reduced;
-    if (roi_top < 0) {
-      roi_top = 0;
-    }
-    int roi_left = iris_center_x - iris_reduced;
-    if (roi_left < 0) {
-      roi_left = 0;
-    }
-    int roi_right = iris_center_x + iris_reduced;
-    if (roi_right > width - 1) {
-      roi_right = width - 1;
-    }
-    int roi_bottom = iris_center_y + iris_reduced;
-    if (roi_bottom > height - 1) {
-      roi_bottom = height - 1;
-    }
-
-    Point pupil_center_pt[224];
-    int p_ctr = 0;
-    for (int r = 3; r < 25; r += 3) {
-      for (int j = 0; j < 61; j += 10) {
-        pupil_center_pt[p_ctr].X = trig_vals_[j][r][0];
-        pupil_center_pt[p_ctr].Y = trig_vals_[j][r][1];
-        pupil_center_pt[p_ctr + 56].X = trig_vals_[j][r][0];
-        pupil_center_pt[p_ctr + 56].Y = -trig_vals_[j][r][1];
-        pupil_center_pt[p_ctr + 112].X = -trig_vals_[j][r][0];
-        pupil_center_pt[p_ctr + 112].Y = trig_vals_[j][r][1];
-        pupil_center_pt[p_ctr + 168].X = -trig_vals_[j][r][0];
-        pupil_center_pt[p_ctr + 168].Y = -trig_vals_[j][r][1];
-        p_ctr++;
-      }
-    }
-
-    int best_response = 0;
-    int ipgs_response = 0;
-    int ipgs_points_used = 0;
-    int pt_val = 0;
-    for (int r = min_p_r_trial_; r < max_p_r_trial_; r++) {
-      for (int i_x = roi_left; i_x < roi_right; i_x++) {
-        for (int i_y = roi_top; i_y < roi_bottom; i_y++) {
-          int dark_pupil_val = 0;
-          int pt_dark_val = 0;
-          int trial_x = 0;
-          int trial_y = 0;
-
-          for (p_ctr= 0; p_ctr < 224; p_ctr++) {
-            trial_x = i_x + pupil_center_pt[p_ctr].X;
-            trial_y = i_y - pupil_center_pt[p_ctr].Y;
-
-            if (trial_x > 0 && trial_x < width && trial_y < height && trial_y > 0) {
-              pt_val = (int) ds_raw_bin_[trial_x][trial_y];
-              // experimental kb
-              // Limit pupil values to max_pupil_pt_intensity to reduce effects of specularities with 255 intensity
-              int max_pupil_pt_intensity = 100;
-              if (pt_val > max_pupil_pt_intensity) {
-                pt_val = max_pupil_pt_intensity;
-              }
-              // pt_dark_val is the difference between the maximum_pupil_pt_intensity and the intensity of the pupil point
-              // this value is higher if the point is darker
-              pt_dark_val = max_pupil_pt_intensity - pt_dark_val;
-
-              if (pt_dark_val < 0) {
-                pt_dark_val = 0;
-              }
-              // Use a weighting factor of 1/5 to limit the cumulative response held by dark_pupil_val (accumulator)
-              pt_dark_val /= 5;
-              dark_pupil_val = dark_pupil_val + pt_dark_val;
-            }
-          }
-          ipgs_response = 0;
-          ipgs_points_used = 0;
-
-          int right_edge_points_used = 0;
-          int left_edge_points_used = 0;
-          int trial_response = 0;
-          int left_edge_response = 0;
-          int right_edge_response = 0;
-
-          for (int j = 0; j < p_max_seg_trial; j++, j++) {
-            int r_x = i_x + trig_vals_[j][r][0];
-            int u_y = i_y - trig_vals_[j][r][1];
-            int l_x = i_x - trig_vals_[j][r][0];
-            int l_y = i_y + trig_vals_[j][r][1];
-
-            if (r_x + 4 < width - 1 && r_x - 4 >= 0) {
-              if (u_y >= 0 && j < p_upper_seg_trial_) {
-                right_edge_response += 2 * edge_v[r_x][u_y];
-                right_edge_response += edge_v[r_x - 1][u_y];
-                right_edge_response += edge_v[r_x + 1][u_y];
-                right_edge_points_used++;
-              }
-              if (l_y < height - 1 && j < p_lower_seg_trial_) {
-                right_edge_response += 2 * edge_v[r_x][l_y];
-                right_edge_response += edge_v[r_x - 1][l_y];
-                right_edge_response += edge_v[r_x + 1][l_y];
-                right_edge_points_used++;
-              }
-            }
-            if (l_x - 4 >= 0 && r_x + 4 <= width - 1) {
-              if (u_y >= 0 && j < p_upper_seg_trial_) {
-                left_edge_response += 2 * edge_v[l_x][u_y];
-                left_edge_response += edge_v[l_x - 1][u_y];
-                left_edge_response += edge_v[l_x + 1][u_y];
-                left_edge_points_used++;
-              }
-              if (l_y < height - 1 && j < p_lower_seg_trial_) {
-                left_edge_response += 2 * edge_v[l_x][l_y];
-                left_edge_response += edge_v[l_x - 1][l_y];
-                left_edge_response += edge_v[l_x + 1][l_y];
-                left_edge_points_used++;
-              }
-            }
-          }
-
-          int edge_response;
-          if (left_edge_points_used + right_edge_points_used) {
-            edge_response =
-                (left_edge_response + right_edge_response) * 100 / (left_edge_points_used + right_edge_points_used);
-          } else {
-            edge_response = 0;
-          }
-
-          trial_response = edge_response + dark_pupil_val;
-          if (trial_response > best_response) {
-            best_response = trial_response;
-            pupil_cx_ = (i_x - 1) * 4;
-            pupil_cy_ = (i_y) * 4;
-            pupil_rad_ = (r) * 4;
-            pupil_d_ = r * 8;
-          }
-
-          int pup_ic_dist = (int) sqrt((double) ((iris_center_y - i_y) * (iris_center_y - i_y)
-              + (iris_center_x - i_x) * (iris_center_x - i_x)));
-          if ((pup_ic_dist + r) > (iris_diameter / 2) * 65 / 100
-              || (i_y + r) > (iris_center_y + (iris_diameter / 2) * 65 / 100)
-              || (i_y - r) < (i_y - (iris_center_y / 2) * 65 / 100)) {
-            i_y = roi_bottom;
-          }
-        }
-
-        if ((i_x + r) > (iris_center_x + (iris_diameter / 2) * 65 / 100)
-            || (iris_center_x - r) < (i_x - (iris_diameter / 2) * 65 / 100)) {
-          i_x = roi_right;
-        }
-      }
-    }
-
-    int rough_pupil_center_x = pupil_cx_;
-    int rough_pupil_center_y = pupil_cy_;
-    int rough_pupil_radius = pupil_rad_;
-    int rough_pupil_diameter = pupil_rad_ * 2;
-
-    FindFinePupil(rough_pupil_center_x, rough_pupil_center_y, width * 4, height * 4);
-
-    ipgs_response = 0;
-    ipgs_points_used = 0;
-    int i_x = pupil_cx_ / 4;
-    int i_y = pupil_cy_ / 4;
-    int r = pupil_rad_ / 4;
-    for (int j_x = -20; j_x < 20; j_x++) {
-      for (int j_y = -5; j_y < 5; j_y++) {
-        if ((i_x + j_x - r) > 0 && ((i_x + j_x + r) < (width - 1)) && (i_y + j_y) > 0 && ((i_y + j_y) < (height - 1))) {
-          ipgs_response += edge_v[i_x - r + j_x][i_y + j_y];
-          ipgs_points_used++;
-          ipgs_response += edge_v[i_x + r + j_x][i_y + j_y];
-          ipgs_points_used++;
-        }
-      }
-    }
-
-    iris_pupil_gs_diff_ = (double) ipgs_response / (double) ipgs_points_used;
-    iris_pupil_diameter_ratio_ = (double) pupil_rad_ / (double) iris_radius_;
-  } catch (std::exception &ex) {
-    std::cerr << "exception caught: " << ex.what() << std::endl;
-    pupil_cx_ = iris_center_x_;
-    pupil_cy_ = iris_center_y;
-    pupil_rad_ = 30;
-    pupil_d_ = iris_radius_ * 2;
-    iris_pupil_diameter_ratio_ = .2;
-    iris_pupil_gs_diff_ = 0;
-  }
-}
-
-void MFilter::FindFinePupil(int rough_pupil_center_x, int rough_pupil_center_y, int width, int height) {
-  try {
-    int min_pupil_center_x_fine = pupil_cx_ - 16;
-    int max_pupil_center_x_fine = pupil_cx_ + 16;
-    int min_pupil_center_y_fine = pupil_cy_ - 16;
-    int max_pupil_center_y_fine = pupil_cy_ + 16;
-    int min_radius_fine = 16;
-    int max_radius_fine = pupil_rad_ + 16;
-    if (max_radius_fine > max_p_r_trial_ * 4) {
-      max_radius_fine = max_p_r_trial_ * 4;
-    }
-
-    int seg_best_r[256];
-    for (int counter = 0; counter < 256; counter++) {
-      seg_best_r[counter] = 0;
-    }
-
-    int best_response = 0;
-    for (int r = min_radius_fine; r < max_radius_fine; r++) {
-      for (int i_x = min_pupil_center_x_fine; i_x < max_pupil_center_x_fine; i_x++) {
-        for (int i_y = min_pupil_center_y_fine; i_y < max_pupil_center_y_fine; i_y++) {
-          int trial_response = 0;
-
-          for (int j = 0; j < 256; j++) {
-            int point_response = 0;
-            seg_best_r[j] = 0;
-
-            int r_x = i_x + (int) trig_vals_[j][r + 16][0];
-            int u_y = i_y - (int) trig_vals_[j][r + 16][1];
-
-            if (r_x < width && r_x >= 0 && u_y >= 0 && u_y < height) {
-              int outer_point_val = 0;
-              int inner_point_val = 0;
-              int inner_point_x = 0;
-              int inner_point_y = 0;
-              int outer_point_x = 0;
-              int outer_point_y = 0;
-
-              int max_pupil_point_intensity = 50;
-              int max_iris_point_intensity = 220;
-              int partial_point_response = 0;
-
-              for (int r_ctr = 1; r_ctr < 8; r_ctr++, r_ctr++) {
-                int trig_val_inner_x = trig_vals_[j][r - r_ctr][0];
-                int trig_val_outer_x = trig_vals_[j][r + r_ctr][0];
-                int trig_val_outer_y = -trig_vals_[j][r + r_ctr][1];
-                int trig_val_inner_y = trig_vals_[j][r + r_ctr][1];
-
-                outer_point_x = i_x + trig_vals_[j][r + r_ctr][0];
-                inner_point_x = i_x + trig_vals_[j][r - r_ctr][0];
-                outer_point_y = i_y - trig_vals_[j][r + r_ctr][1];
-                inner_point_y = i_y + trig_vals_[j][r - r_ctr][1];
-                if (outer_point_x > 0 && outer_point_x < width && outer_point_y > 0 && outer_point_y < height &&
-                    inner_point_x > 0 && inner_point_x < width && inner_point_y > 0 && inner_point_y < height) {
-                  outer_point_val = (int) raw_bin_[outer_point_x][outer_point_y];
-                  inner_point_val = (int) raw_bin_[inner_point_x][inner_point_y];
-                } else {
-                  outer_point_val = 0;
-                  inner_point_val = 0;
-                }
-                if (outer_point_val < max_iris_point_intensity && inner_point_val < max_pupil_point_intensity) {
-                  partial_point_response = outer_point_val - inner_point_val;
-                  if (partial_point_response > 0) {
-                    point_response = point_response + partial_point_response;
-                  }
-                }
-              }
-            }
-            trial_response = trial_response + point_response;
-          }
-          if (trial_response > best_response) {
-            best_response = trial_response;
-            pupil_cx_ = i_x;
-            pupil_cy_ = i_y;
-            pupil_rad_ = r;
-          }
-
-          std::string i_x_str = std::to_string(i_x);
-          std::string i_y_str = std::to_string(i_y);
-          std::string r_str = std::to_string(r);
-          std::string radius_str = std::to_string(pupil_rad_);
-          std::string pupil_center_x_str = std::to_string(pupil_cx_);
-          std::string pupil_center_y_str = std::to_string(pupil_cy_);
-          std::string response_str = std::to_string(trial_response);
-          std::string best_response_str = std::to_string(best_response);
-        }
-      }
-
-    }
-    int pupil_center_x = pupil_cx_;
-    int pupil_center_y = pupil_cy_;
-    int pupil_radius = pupil_rad_;
-    pupil_center_x_ = pupil_cx_;
-    pupil_center_y_ = pupil_cy_;
-    pupil_radius_ = pupil_rad_;
-
-    for (int j = 0; j < 256; j++) {
-      int best_radial_response = 0;
-      int inner_point_x = 0;
-      int inner_point_y = 0;
-      int outer_point_x = 0;
-      int outer_point_y = 0;
-      int outer_point_val = 120;
-      int inner_point_val = 10;
-      int max_pupil_point_intensity = 50;
-      int max_iris_point_intensity = 150;
-      int err_x_negative_value_exceeded = 0;
-      int err_width_exceeded = 0;
-      int err_y_negative_value_exceeded = 0;
-      int err_height_exceeded = 0;
-      for (int r = min_radius_fine; r < max_radius_fine; r++) {
-        int point_response = 0;
-
-        for (int rr = 1; rr < 16; rr++) {
-          outer_point_x = pupil_cx_ + trig_vals_[j][r + rr][0];
-          inner_point_x = pupil_cx_ - trig_vals_[j][r - rr][0];
-          outer_point_y = pupil_cy_ - trig_vals_[j][r + rr][1];
-          inner_point_y = pupil_cy_ + trig_vals_[j][r + rr][1];
-          // modified 2022_03_10 to avoid segfaults
-          if (outer_point_x >= 0 && outer_point_x < width && outer_point_y >= 0 && outer_point_y < height
-              && inner_point_x >= 0 && inner_point_y >= 0) {
-            outer_point_val = (int) raw_bin_[outer_point_x][outer_point_y];
-            inner_point_val = (int) raw_bin_[inner_point_x][inner_point_y];
-            if (outer_point_val < max_iris_point_intensity && inner_point_val < max_pupil_point_intensity) {
-              point_response = point_response + (outer_point_val - inner_point_val);
-            }
-          }
-          // end of modified code
-
-        }
-        if (point_response > best_radial_response) {
-          seg_best_r[j] = r;
-          best_radial_response = point_response;
-        }
-      }
-    }
-
-    int num_angles_used = 0;
-    double total_deviation = 0.0;
-    for (int j = 0; j < 256; j++) {
-      dimless_r_[j] = 0.0;
-
-      if (seg_best_r[j] > 0) {
-        dimless_r_[j] = (double) seg_best_r[j] / (double) pupil_radius;
-        double deviation = dimless_r_[j] - 1.0f;
-        total_deviation = total_deviation + std::abs(deviation);
-        num_angles_used++;
-      }
-    }
-
-    if (num_angles_used > 0) {
-      pupil_circularity_avg_deviation_ = total_deviation / (double) num_angles_used;
-    }
-  } catch (std::exception &ex) {
-    std::cerr << "exception caught: " << ex.what() << std::endl;
-  }
-}
 
 void MFilter::FindOcclusions(uint8_t **raw_img, int width, int height, int iris_center_x, int iris_center_y,
                              int iris_radius, int pupil_center_x, int pupil_center_y, int pupil_radius) {
@@ -2046,23 +1417,701 @@ void MFilter::CheckMargins(int width, int height, int iris_center_x, int iris_ce
   overall_margin_ = 1.0 - overall_margin_deduct;
 }
 
+void MFilter::FindIris(const uint8_t *frame_bytes, int width, int height) {
+  uint8_t **raw_img = new uint8_t *[width];
+  for (int i = 0; i < width; i++) {
+    raw_img[i] = new uint8_t[height];
+  }
+
+  RawByteFrameToTwoDimArray(frame_bytes, raw_img, width, height);
+  FindIris(raw_img, width, height);
+
+  for (int i = 0; i < width; i++) {
+    delete[] raw_img[i];
+  }
+
+  delete[] raw_img;
+}
+
+void MFilter::FindIris(uint8_t **raw_bytes, int width, int height) {
+  for (int i = 0; i < width; i++) {
+    for (int j = 0; j < height; j++) {
+      raw_bin_[i][j] = raw_bytes[i][j];
+    }
+  }
+
+  int ds_factor = 4;
+  int ds_width = width / ds_factor;
+  int ds_height = height / ds_factor;
+
+  DownSize(raw_bytes, width, height, ds_factor, ds_raw_bin_);
+  EdgeMap(ds_raw_bin_, ds_width, ds_height);
+  GetVertEdges(ds_raw_bin_, ds_width, ds_height);
+  FindIrisCenter(edge_val_bin_, edge_val_bin_, ds_width, ds_height, raw_bin_);
+}
+
+void MFilter::FindIrisCenter(int **l_edge_vals, int **r_edge_vals, int width,
+                             int height, uint8_t **raw_bytes) {
+  lower_seg_trial_ = 47;
+  upper_seg_trial_ = 40;
+
+  int max_seg_trial = upper_seg_trial_;
+  if (lower_seg_trial_ > max_seg_trial) {
+    max_seg_trial = lower_seg_trial_;
+  }
+
+  Point iris_center_pt[224];
+  int ctr = 0;
+  for (int r = 2; r < 17; r += 2) {
+    for (int j = 0; j < 61; j += 10) {
+      iris_center_pt[ctr].X = trig_vals_[j][r][0];
+      iris_center_pt[ctr].Y = trig_vals_[j][r][1];
+
+      iris_center_pt[ctr + 56].X = trig_vals_[j][r][0];
+      iris_center_pt[ctr + 56].Y = -trig_vals_[j][r][1];
+      iris_center_pt[ctr + 112].X = -trig_vals_[j][r][0];
+      iris_center_pt[ctr + 112].Y = trig_vals_[j][r][1];
+      iris_center_pt[ctr + 168].X = -trig_vals_[j][r][0];
+      iris_center_pt[ctr + 168].Y = -trig_vals_[j][r][1];
+      ctr++;
+    }
+  }
+
+  int best_response = 0;
+  for (int r = min_r_trial_; r < max_r_trial_; r++, r++) {
+    for (int i_x = width * 1 / 10; i_x < width * 9 / 10; i_x++, i_x++) {
+      for (int i_y = height * 1 / 10; i_y < height * 9 / 10; i_y++, i_y++) {
+        int dark_iris_center = 0;
+        int trial_response = 0;
+        int left_edge_response = 0;
+        int right_edge_response = 0;
+        int vert_edge_response = 0;
+        int pt_dark_val = 0;
+        int trial_x = 0;
+        int trial_y = 0;
+
+        for (int i_ctr = 0; i_ctr < 224; i_ctr++) {
+          trial_x = i_x + iris_center_pt[i_ctr].X;
+          trial_y = i_y - iris_center_pt[i_ctr].Y;
+
+          if (trial_x > 0 && trial_x < width && trial_y < height && trial_y > 0) {
+            pt_dark_val = (int) ds_raw_bin_[trial_x][trial_y];
+            pt_dark_val = (55 - pt_dark_val);
+
+            if (pt_dark_val < 0) {
+              pt_dark_val = 0;
+            }
+            dark_iris_center += pt_dark_val;
+          }
+        }
+        for (int j_x = 0; j_x < max_seg_trial; j_x++) {
+          int r_x = i_x + trig_vals_[j_x][r][0];
+          int u_y = i_y - trig_vals_[j_x][r][1];
+          int l_x = i_x - trig_vals_[j_x][r][0];
+          int l_y = i_y + trig_vals_[j_x][r][1];
+
+          if (r_x + 4 < width - 1 && r_x - 2 >= 0) {
+            if (u_y >= 4 && j_x < upper_seg_trial_) {
+              right_edge_response += r_edge_vals[r_x][u_y];
+              vert_edge_response += vert_edge_[r_x][u_y];
+              right_edge_response += edge_val_bin_[r_x - 1][u_y];
+              vert_edge_response += vert_edge_[r_x - 1][u_y];
+              right_edge_response += edge_val_bin_[r_x + 1][u_y];
+              vert_edge_response += vert_edge_[r_x + 1][u_y];
+            }
+            if (l_y < height - 3 && j_x < lower_seg_trial_) {
+              right_edge_response += edge_val_bin_[r_x][l_y];
+              vert_edge_response += vert_edge_[r_x][l_y];
+              right_edge_response += edge_val_bin_[r_x - 1][l_y];
+              vert_edge_response += vert_edge_[r_x - 1][l_y];
+              right_edge_response += edge_val_bin_[r_x + 1][l_y];
+              vert_edge_response += vert_edge_[r_x + 1][l_y];
+            }
+          }
+
+          if (l_x - 2 >= 0 && r_x + 4 < width - 1) {
+            if (u_y >= 4 && j_x < upper_seg_trial_) {
+              left_edge_response += l_edge_vals[l_x][u_y];
+              vert_edge_response += vert_edge_[l_x][u_y];
+              left_edge_response += edge_val_bin_[l_x - 1][u_y];
+              vert_edge_response += vert_edge_[l_x - 1][u_y];
+              left_edge_response += edge_val_bin_[l_x + 1][u_y];
+              vert_edge_response += vert_edge_[l_x + 1][u_y];
+            }
+            if (l_y < height - 1 && j_x < lower_seg_trial_) {
+              left_edge_response += edge_val_bin_[l_x][l_y];
+              vert_edge_response += vert_edge_[l_x][l_y];
+              left_edge_response += edge_val_bin_[l_x - 1][l_y];
+              vert_edge_response += vert_edge_[l_x - 1][l_y];
+              left_edge_response += edge_val_bin_[l_x + 1][l_y];
+              vert_edge_response += vert_edge_[l_x + 1][l_y];
+            }
+          }
+        }
+
+        dark_iris_center = dark_iris_center * 105 / 10;
+        vert_edge_response = vert_edge_response * 3 / 10;
+        trial_response =
+            left_edge_response * 15 / 10 + right_edge_response * 15 / 10 + vert_edge_response + dark_iris_center;
+
+        if (trial_response > best_response) {
+          best_response = trial_response;
+          iris_center_x_ = i_x * 4;
+          iris_center_y_ = i_y * 4;
+          iris_radius_ = r * 4;
+        }
+      }
+    }
+  }
+  FindFineIris(raw_bin_, width * 4, height * 4, iris_center_x_, iris_center_y_, iris_radius_ * 2);
+}
+
+void MFilter::FindFineIris(uint8_t **raw_bytes, int width, int height, int rough_iris_center_x,
+                           int rough_iris_center_y, int rough_iris_diameter) {
+  lower_seg_trial_ = 40;
+  upper_seg_trial_ = 30;
+
+  int min_iris_center_x_fine = rough_iris_center_x - 4;
+  int max_iris_center_x_fine = rough_iris_center_x + 4;
+  int min_iris_center_y_fine = rough_iris_center_y - 4;
+  int max_iris_center_y_fine = rough_iris_center_y + 4;
+  int min_radius_fine = rough_iris_diameter / 2 - 4;
+  int max_radius_fine = rough_iris_diameter / 2 + 4;
+  if (max_radius_fine > max_radius_) {
+    max_radius_fine = max_radius_;
+  }
+
+  Point tan_pts[33];
+  int best_response = 0;
+  for (int r = min_radius_fine; r < max_radius_fine; r++) {
+    for (int i_x = min_iris_center_x_fine; i_x < max_iris_center_x_fine; i_x++) {
+      for (int i_y = min_iris_center_y_fine; i_y < max_iris_center_y_fine; i_y++) {
+        int right_edge_points_used = 0;
+        int left_edge_points_used = 0;
+        int trial_response = 0;
+        int left_edge_response = 0;
+        int right_edge_response = 0;
+
+        for (int j_x = 0; j_x < lower_seg_trial_; j_x += 2) {
+          int r_x = i_x + trig_vals_[j_x][r + 16][0];
+          int u_y = i_y - trig_vals_[j_x][r + 16][1];
+          int l_x = i_x - trig_vals_[j_x][r + 16][0];
+          int l_y = i_y + trig_vals_[j_x][r + 16][1];
+
+          int w_f = 1;
+          if (r_x < width && l_x >= 0) {
+            if (u_y >= 0 && j_x < upper_seg_trial_) {
+              int point_response = 0;
+
+              for (int r_ctr = 0; r_ctr < 16; r_ctr++, r_ctr++) {
+                w_f = 4 - (r_ctr / 4);
+                point_response += w_f *
+                    ((int) raw_bytes[i_x + trig_vals_[j_x][r + r_ctr][0]][i_y - trig_vals_[j_x][r + r_ctr][1]] -
+                        (int) raw_bytes[i_x + trig_vals_[j_x][r - r_ctr][0]][i_y - trig_vals_[j_x][r - r_ctr][1]]);
+              }
+              if (point_response < 0) point_response = -point_response;
+              if (point_response > max_point_response_) point_response = max_point_response_;
+              right_edge_response += point_response;
+              right_edge_points_used++;
+            }
+            if (l_y < width && j_x < lower_seg_trial_) {
+              int point_response = 0;
+              for (int r_ctr = 0; r_ctr < 16; r_ctr++) {
+                w_f = 4 - (r_ctr / 4);
+                point_response += w_f *
+                    ((int) raw_bytes[i_x + trig_vals_[j_x][r + r_ctr][0]][i_y + trig_vals_[j_x][r + r_ctr][1]] -
+                        (int) raw_bytes[i_x + trig_vals_[j_x][r - r_ctr][0]][i_y + trig_vals_[j_x][r - r_ctr][1]]);
+              }
+              if (point_response < 0) point_response = -point_response;
+              if (point_response > max_point_response_) point_response = max_point_response_;
+              right_edge_response += point_response;
+              right_edge_points_used++;
+            }
+          }
+          if (l_x >= 0 && r_x <= width) {
+            if (u_y >= 0 && j_x < upper_seg_trial_) {
+              int point_response = 0;
+              for (int r_ctr = 0; r_ctr < 16; r_ctr++) {
+                w_f = 4 - (r_ctr / 4);
+                point_response += w_f *
+                    ((int) raw_bytes[i_x - trig_vals_[j_x][r + r_ctr][0]][i_y - trig_vals_[j_x][r + r_ctr][1]] -
+                        (int) raw_bytes[i_x - trig_vals_[j_x][r - r_ctr][0]][i_y - trig_vals_[j_x][r - r_ctr][1]]);
+              }
+              if (point_response < 0) point_response = -point_response;
+              if (point_response > max_point_response_) point_response = max_point_response_;
+              left_edge_response += point_response;
+              left_edge_points_used++;
+            }
+            if (l_y < height - 1 && j_x < lower_seg_trial_) {
+              int point_response = 0;
+              for (int r_ctr = 0; r_ctr < 16; r_ctr++) {
+                w_f = 4 - (r_ctr / 4);
+                point_response += w_f *
+                    ((int) raw_bytes[i_x - trig_vals_[j_x][r + r_ctr][0]][i_y + trig_vals_[j_x][r + r_ctr][1]] -
+                        (int) raw_bytes[i_x - trig_vals_[j_x][r - r_ctr][0]][i_y + trig_vals_[j_x][r - r_ctr][1]]);
+              }
+              if (point_response < 0) point_response = -point_response;
+              if (point_response > max_point_response_) point_response = max_point_response_;
+              left_edge_response += point_response;
+              left_edge_points_used++;
+            }
+          }
+        }
+        trial_response = left_edge_response + right_edge_response;
+        if (trial_response > best_response) {
+          best_response = trial_response;
+          iris_center_x_ = i_x;
+          iris_center_y_ = i_y;
+          iris_radius_ = r;
+        }
+      }
+    }
+  }
+
+  int i_c_x = iris_center_x_;
+  int i_c_y = iris_center_y_;
+  int i_radius = iris_radius_;
+  n_iso_iris_diameter_value_ = 1.0;
+  if (iris_radius_ < 25) n_iso_iris_diameter_value_ = 0.0;
+  if (iris_radius_ > max_radius_ - 16) {
+    n_iso_iris_diameter_value_ = 0.0;
+    throw new std::out_of_range("Iris Radius exceeds max allowable");
+  }
+  if (iris_radius_ < 17) {
+    n_iso_iris_diameter_value_ = 0.0;
+    throw new std::out_of_range("Invalid Iris Diameter value");
+  }
+
+  for (int j = 0; j < max_segs_; j++) {
+    for (int r_ctr = 0; r_ctr < 33; r_ctr++) {
+      tan_pts[r_ctr].X = i_c_x + trig_vals_[j][i_radius + r_ctr - 16][0];
+      tan_pts[r_ctr].Y = i_c_y - trig_vals_[j][i_radius + r_ctr - 16][1];
+    }
+    int point_response = 0;
+    for (int r_ctr = 1; r_ctr < 16; r_ctr++) {
+      if (tan_pts[16 + r_ctr].X > 0 && tan_pts[16 + r_ctr].X < width &&
+          tan_pts[16 + r_ctr].Y > 0 && tan_pts[16 + r_ctr].Y < height) {
+        int outer_point_val = (int) raw_bytes[tan_pts[16 + r_ctr].X][tan_pts[16 + r_ctr].Y];
+        int inner_point_val = (int) raw_bytes[tan_pts[16 - r_ctr].X][tan_pts[16 - r_ctr].Y];
+        int response = outer_point_val - inner_point_val;
+        if (response > 75) response = 75;
+        point_response = point_response + response;
+      } else {
+        point_response = 0;
+      }
+    }
+    isgs_vals_[j] = point_response;
+  }
+
+  int isgs_total = 0;
+  int pts_used = 0;
+  for (int j_ctr = 0; j_ctr < 40; j_ctr++) {
+    isgs_total = isgs_total + isgs_vals_[255 - j_ctr]; pts_used++;
+    isgs_total = isgs_total + isgs_vals_[128 + j_ctr]; pts_used++;
+  }
+  for (int j_ctr = 0; j_ctr < 20; j_ctr++) {
+    isgs_total = isgs_total + isgs_vals_[j_ctr]; pts_used++;
+    isgs_total = isgs_total + isgs_vals_[127 - j_ctr]; pts_used++;
+  }
+
+  isgs_diff_mean_avg_ = isgs_total / (pts_used * 15);
+  if (isgs_diff_mean_avg_ < 0) isgs_diff_mean_avg_ = 0;
+}
+
+void MFilter::FindPupilCenter(int **edge_v, int width, int height, int iris_center_x,
+                              int iris_center_y, int iris_diameter) {
+  pupil_cx_ = iris_center_x * 4;
+  pupil_cy_ = iris_center_y * 4;
+  pupil_rad_ = 5 * 4;
+  pupil_d_ = pupil_rad_ * 2;
+  try {
+    max_p_r_trial_ = iris_diameter / 2 * 6 / 10;
+    p_upper_seg_trial_ = 55;
+    p_lower_seg_trial_ = 55;
+    int p_max_seg_trial = p_upper_seg_trial_;
+    if (p_lower_seg_trial_ > p_max_seg_trial) p_max_seg_trial = p_lower_seg_trial_;
+
+    int iris_reduced = iris_diameter / 10;
+    int roi_top = iris_center_y - iris_reduced; if (roi_top < 0) roi_top = 0;
+    int roi_left = iris_center_x - iris_reduced; if (roi_left < 0) roi_left = 0;
+    int roi_right = iris_center_x + iris_reduced; if (roi_right > width - 1) roi_right = width - 1;
+    int roi_bottom = iris_center_y + iris_reduced; if (roi_bottom > height - 1) roi_bottom = height - 1;
+
+    Point pupil_center_pt[224];
+    int p_ctr = 0;
+    for (int r = 3; r < 25; r += 3) {
+      for (int j = 0; j < 61; j += 10) {
+        pupil_center_pt[p_ctr].X = trig_vals_[j][r][0];
+        pupil_center_pt[p_ctr].Y = trig_vals_[j][r][1];
+        pupil_center_pt[p_ctr + 56].X = trig_vals_[j][r][0];
+        pupil_center_pt[p_ctr + 56].Y = -trig_vals_[j][r][1];
+        pupil_center_pt[p_ctr + 112].X = -trig_vals_[j][r][0];
+        pupil_center_pt[p_ctr + 112].Y = trig_vals_[j][r][1];
+        pupil_center_pt[p_ctr + 168].X = -trig_vals_[j][r][0];
+        pupil_center_pt[p_ctr + 168].Y = -trig_vals_[j][r][1];
+        p_ctr++;
+      }
+    }
+
+    int best_response = 0;
+    int pt_val = 0;
+    for (int r = min_p_r_trial_; r < max_p_r_trial_; r++) {
+      for (int i_x = roi_left; i_x < roi_right; i_x++) {
+        for (int i_y = roi_top; i_y < roi_bottom; i_y++) {
+          int dark_pupil_val = 0;
+          int pt_dark_val = 0;
+          int trial_x = 0;
+          int trial_y = 0;
+
+          for (p_ctr = 0; p_ctr < 224; p_ctr++) {
+            trial_x = i_x + pupil_center_pt[p_ctr].X;
+            trial_y = i_y - pupil_center_pt[p_ctr].Y;
+            if (trial_x > 0 && trial_x < width && trial_y < height && trial_y > 0) {
+              pt_val = (int) ds_raw_bin_[trial_x][trial_y];
+              int max_pupil_pt_intensity = 100;
+              if (pt_val > max_pupil_pt_intensity) pt_val = max_pupil_pt_intensity;
+              pt_dark_val = max_pupil_pt_intensity - pt_dark_val;
+              if (pt_dark_val < 0) pt_dark_val = 0;
+              pt_dark_val /= 5;
+              dark_pupil_val = dark_pupil_val + pt_dark_val;
+            }
+          }
+
+          int right_edge_points_used = 0;
+          int left_edge_points_used = 0;
+          int trial_response = 0;
+          int left_edge_response = 0;
+          int right_edge_response = 0;
+
+          for (int j = 0; j < p_max_seg_trial; j++, j++) {
+            int r_x = i_x + trig_vals_[j][r][0];
+            int u_y = i_y - trig_vals_[j][r][1];
+            int l_x = i_x - trig_vals_[j][r][0];
+            int l_y = i_y + trig_vals_[j][r][1];
+
+            if (r_x + 4 < width - 1 && r_x - 4 >= 0) {
+              if (u_y >= 0 && j < p_upper_seg_trial_) {
+                right_edge_response += 2 * edge_v[r_x][u_y];
+                right_edge_response += edge_v[r_x - 1][u_y];
+                right_edge_response += edge_v[r_x + 1][u_y];
+                right_edge_points_used++;
+              }
+              if (l_y < height - 1 && j < p_lower_seg_trial_) {
+                right_edge_response += 2 * edge_v[r_x][l_y];
+                right_edge_response += edge_v[r_x - 1][l_y];
+                right_edge_response += edge_v[r_x + 1][l_y];
+                right_edge_points_used++;
+              }
+            }
+            if (l_x - 4 >= 0 && r_x + 4 <= width - 1) {
+              if (u_y >= 0 && j < p_upper_seg_trial_) {
+                left_edge_response += 2 * edge_v[l_x][u_y];
+                left_edge_response += edge_v[l_x - 1][u_y];
+                left_edge_response += edge_v[l_x + 1][u_y];
+                left_edge_points_used++;
+              }
+              if (l_y < height - 1 && j < p_lower_seg_trial_) {
+                left_edge_response += 2 * edge_v[l_x][l_y];
+                left_edge_response += edge_v[l_x - 1][l_y];
+                left_edge_response += edge_v[l_x + 1][l_y];
+                left_edge_points_used++;
+              }
+            }
+          }
+
+          int edge_response;
+          if (left_edge_points_used + right_edge_points_used)
+            edge_response = (left_edge_response + right_edge_response) * 100 / (left_edge_points_used + right_edge_points_used);
+          else
+            edge_response = 0;
+
+          trial_response = edge_response + dark_pupil_val;
+          if (trial_response > best_response) {
+            best_response = trial_response;
+            pupil_cx_ = (i_x - 1) * 4;
+            pupil_cy_ = (i_y) * 4;
+            pupil_rad_ = (r) * 4;
+            pupil_d_ = r * 8;
+          }
+
+          int pup_ic_dist = (int) sqrt((double) ((iris_center_y - i_y) * (iris_center_y - i_y)
+              + (iris_center_x - i_x) * (iris_center_x - i_x)));
+          if ((pup_ic_dist + r) > (iris_diameter / 2) * 65 / 100
+              || (i_y + r) > (iris_center_y + (iris_diameter / 2) * 65 / 100)
+              || (i_y - r) < (i_y - (iris_center_y / 2) * 65 / 100))
+            i_y = roi_bottom;
+        }
+        if ((i_x + r) > (iris_center_x + (iris_diameter / 2) * 65 / 100)
+            || (iris_center_x - r) < (i_x - (iris_diameter / 2) * 65 / 100))
+          i_x = roi_right;
+      }
+    }
+
+    int rough_pupil_center_x = pupil_cx_;
+    int rough_pupil_center_y = pupil_cy_;
+    FindFinePupil(rough_pupil_center_x, rough_pupil_center_y, width * 4, height * 4);
+
+    int ipgs_response = 0;
+    int ipgs_points_used = 0;
+    int i_x = pupil_cx_ / 4;
+    int i_y = pupil_cy_ / 4;
+    int r = pupil_rad_ / 4;
+    for (int j_x = -20; j_x < 20; j_x++) {
+      for (int j_y = -5; j_y < 5; j_y++) {
+        if ((i_x + j_x - r) > 0 && ((i_x + j_x + r) < (width - 1)) && (i_y + j_y) > 0 && ((i_y + j_y) < (height - 1))) {
+          ipgs_response += edge_v[i_x - r + j_x][i_y + j_y]; ipgs_points_used++;
+          ipgs_response += edge_v[i_x + r + j_x][i_y + j_y]; ipgs_points_used++;
+        }
+      }
+    }
+    iris_pupil_gs_diff_ = (double) ipgs_response / (double) ipgs_points_used;
+    iris_pupil_diameter_ratio_ = (double) pupil_rad_ / (double) iris_radius_;
+  } catch (std::exception &ex) {
+    std::cerr << "exception caught: " << ex.what() << std::endl;
+    pupil_cx_ = iris_center_x_;
+    pupil_cy_ = iris_center_y;
+    pupil_rad_ = 30;
+    pupil_d_ = iris_radius_ * 2;
+    iris_pupil_diameter_ratio_ = .2;
+    iris_pupil_gs_diff_ = 0;
+  }
+}
+
+void MFilter::FindFinePupil(int rough_pupil_center_x, int rough_pupil_center_y, int width, int height) {
+  try {
+    int min_pupil_center_x_fine = pupil_cx_ - 16;
+    int max_pupil_center_x_fine = pupil_cx_ + 16;
+    int min_pupil_center_y_fine = pupil_cy_ - 16;
+    int max_pupil_center_y_fine = pupil_cy_ + 16;
+    int min_radius_fine = 16;
+    int max_radius_fine = pupil_rad_ + 16;
+    if (max_radius_fine > max_p_r_trial_ * 4) max_radius_fine = max_p_r_trial_ * 4;
+
+    int seg_best_r[256];
+    for (int counter = 0; counter < 256; counter++) seg_best_r[counter] = 0;
+
+    int best_response = 0;
+    for (int r = min_radius_fine; r < max_radius_fine; r++) {
+      for (int i_x = min_pupil_center_x_fine; i_x < max_pupil_center_x_fine; i_x++) {
+        for (int i_y = min_pupil_center_y_fine; i_y < max_pupil_center_y_fine; i_y++) {
+          int trial_response = 0;
+          for (int j = 0; j < 256; j++) {
+            int point_response = 0;
+            seg_best_r[j] = 0;
+            int r_x = i_x + (int) trig_vals_[j][r + 16][0];
+            int u_y = i_y - (int) trig_vals_[j][r + 16][1];
+            if (r_x < width && r_x >= 0 && u_y >= 0 && u_y < height) {
+              int max_pupil_point_intensity = 50;
+              int max_iris_point_intensity = 220;
+              int partial_point_response = 0;
+              for (int r_ctr = 1; r_ctr < 8; r_ctr++, r_ctr++) {
+                int outer_point_x = i_x + trig_vals_[j][r + r_ctr][0];
+                int inner_point_x = i_x + trig_vals_[j][r - r_ctr][0];
+                int outer_point_y = i_y - trig_vals_[j][r + r_ctr][1];
+                int inner_point_y = i_y + trig_vals_[j][r - r_ctr][1];
+                int outer_point_val = 0, inner_point_val = 0;
+                if (outer_point_x > 0 && outer_point_x < width && outer_point_y > 0 && outer_point_y < height &&
+                    inner_point_x > 0 && inner_point_x < width && inner_point_y > 0 && inner_point_y < height) {
+                  outer_point_val = (int) raw_bin_[outer_point_x][outer_point_y];
+                  inner_point_val = (int) raw_bin_[inner_point_x][inner_point_y];
+                }
+                if (outer_point_val < max_iris_point_intensity && inner_point_val < max_pupil_point_intensity) {
+                  partial_point_response = outer_point_val - inner_point_val;
+                  if (partial_point_response > 0) point_response += partial_point_response;
+                }
+              }
+            }
+            trial_response += point_response;
+          }
+          if (trial_response > best_response) {
+            best_response = trial_response;
+            pupil_cx_ = i_x;
+            pupil_cy_ = i_y;
+            pupil_rad_ = r;
+          }
+        }
+      }
+    }
+    pupil_center_x_ = pupil_cx_;
+    pupil_center_y_ = pupil_cy_;
+    pupil_radius_ = pupil_rad_;
+
+    for (int j = 0; j < 256; j++) {
+      int best_radial_response = 0;
+      int max_pupil_point_intensity = 50;
+      int max_iris_point_intensity = 150;
+      for (int r = min_radius_fine; r < max_radius_fine; r++) {
+        int point_response = 0;
+        for (int rr = 1; rr < 16; rr++) {
+          int outer_point_x = pupil_cx_ + trig_vals_[j][r + rr][0];
+          int inner_point_x = pupil_cx_ - trig_vals_[j][r - rr][0];
+          int outer_point_y = pupil_cy_ - trig_vals_[j][r + rr][1];
+          int inner_point_y = pupil_cy_ + trig_vals_[j][r + rr][1];
+          if (outer_point_x >= 0 && outer_point_x < width && outer_point_y >= 0 && outer_point_y < height
+              && inner_point_x >= 0 && inner_point_y >= 0) {
+            int outer_point_val = (int) raw_bin_[outer_point_x][outer_point_y];
+            int inner_point_val = (int) raw_bin_[inner_point_x][inner_point_y];
+            if (outer_point_val < max_iris_point_intensity && inner_point_val < max_pupil_point_intensity)
+              point_response += (outer_point_val - inner_point_val);
+          }
+        }
+        if (point_response > best_radial_response) {
+          seg_best_r[j] = r;
+          best_radial_response = point_response;
+        }
+      }
+    }
+
+    int num_angles_used = 0;
+    double total_deviation = 0.0;
+    for (int j = 0; j < 256; j++) {
+      dimless_r_[j] = 0.0;
+      if (seg_best_r[j] > 0) {
+        dimless_r_[j] = (double) seg_best_r[j] / (double) pupil_radius_;
+        double deviation = dimless_r_[j] - 1.0f;
+        total_deviation += std::abs(deviation);
+        num_angles_used++;
+      }
+    }
+    if (num_angles_used > 0) pupil_circularity_avg_deviation_ = total_deviation / (double) num_angles_used;
+  } catch (std::exception &ex) {
+    std::cerr << "exception caught: " << ex.what() << std::endl;
+  }
+}
+
+// CalcIrisScleraGS
+// Replicates the isgs_diff_mean_avg_ computation from FindFineIris.
+// Requires: raw_bin_, trig_vals_, iris_center_x_/y_/radius_ already set
+void MFilter::CalcIrisScleraGS(int width, int height) {
+  int i_c_x = iris_center_x_;
+  int i_c_y = iris_center_y_;
+  int i_radius = iris_radius_;
+
+  for (int j = 0; j < max_segs_; j++) {
+    int point_response = 0;
+    for (int r_ctr = 1; r_ctr < 16; r_ctr++) {
+      // outer = further from centre (sclera side), inner = closer to centre (iris side)
+      int outer_x = i_c_x + trig_vals_[j][i_radius + r_ctr][0];
+      int outer_y = i_c_y - trig_vals_[j][i_radius + r_ctr][1];
+      int inner_x = i_c_x + trig_vals_[j][i_radius - r_ctr][0];
+      int inner_y = i_c_y - trig_vals_[j][i_radius - r_ctr][1];
+      if (outer_x > 0 && outer_x < width && outer_y > 0 && outer_y < height &&
+          inner_x > 0 && inner_x < width && inner_y > 0 && inner_y < height) {
+        int response = (int) raw_bin_[outer_x][outer_y] - (int) raw_bin_[inner_x][inner_y];
+        if (response > 75) response = 75;
+        point_response += response;
+      } else {
+        point_response = 0;
+      }
+    }
+    isgs_vals_[j] = point_response;
+  }
+
+  int isgs_total = 0;
+  int pts_used = 0;
+  for (int j_ctr = 0; j_ctr < 40; j_ctr++) {
+    isgs_total += isgs_vals_[255 - j_ctr]; pts_used++;
+    isgs_total += isgs_vals_[128 + j_ctr]; pts_used++;
+  }
+  for (int j_ctr = 0; j_ctr < 20; j_ctr++) {
+    isgs_total += isgs_vals_[j_ctr]; pts_used++;
+    isgs_total += isgs_vals_[127 - j_ctr]; pts_used++;
+  }
+
+  isgs_diff_mean_avg_ = (pts_used > 0) ? (isgs_total / (pts_used * 15)) : 0.0;
+  if (isgs_diff_mean_avg_ < 0) isgs_diff_mean_avg_ = 0;
+}
+
+// CalcIrisPupilGS
+// Replicates the iris_pupil_gs_diff_ computation from FindPupilCenter.
+// Requires: edge_val_bin_, pupil_cx_/cy_/rad_ already set.
+void MFilter::CalcIrisPupilGS(int width, int height) {
+  int ipgs_response = 0;
+  int ipgs_points_used = 0;
+  int i_x = pupil_cx_ / 4;
+  int i_y = pupil_cy_ / 4;
+  int r = pupil_rad_ / 4;
+  int ds_w = width / 4;
+  int ds_h = height / 4;
+  for (int j_x = -20; j_x < 20; j_x++) {
+    for (int j_y = -5; j_y < 5; j_y++) {
+      if ((i_x + j_x - r) > 0 && ((i_x + j_x + r) < (ds_w - 1)) &&
+          (i_y + j_y) > 0    && ((i_y + j_y)     < (ds_h - 1))) {
+        ipgs_response += edge_val_bin_[i_x - r + j_x][i_y + j_y]; ipgs_points_used++;
+        ipgs_response += edge_val_bin_[i_x + r + j_x][i_y + j_y]; ipgs_points_used++;
+      }
+    }
+  }
+  iris_pupil_gs_diff_ = (ipgs_points_used > 0)
+      ? (double) ipgs_response / (double) ipgs_points_used
+      : 0.0;
+}
+
+// CalcPupilCircularity
+// Replicates the dimless_r_ / pupil_circularity_avg_deviation_ computation
+// from FindFinePupil (the second per-angle radial-scan pass only).
+// Requires: raw_bin_, trig_vals_, pupil_cx_/cy_/rad_ already set.
+void MFilter::CalcPupilCircularity(int width, int height) {
+  int min_radius_fine = 16;
+  int max_radius_fine = pupil_rad_ + 16;
+  int max_p_r_limit   = iris_radius_ * 6 / 10;
+  if (max_radius_fine > max_p_r_limit * 4) max_radius_fine = max_p_r_limit * 4;
+
+  int seg_best_r[256];
+  for (int j = 0; j < 256; j++) seg_best_r[j] = 0;
+
+  int max_pupil_point_intensity = 50;
+  int max_iris_point_intensity  = 150;
+
+  for (int j = 0; j < 256; j++) {
+    int best_radial_response = 0;
+    for (int r = min_radius_fine; r < max_radius_fine; r++) {
+      int point_response = 0;
+      for (int rr = 1; rr < 16; rr++) {
+        int outer_x = pupil_cx_ + trig_vals_[j][r + rr][0];
+        int inner_x = pupil_cx_ - trig_vals_[j][r - rr][0];
+        int outer_y = pupil_cy_ - trig_vals_[j][r + rr][1];
+        int inner_y = pupil_cy_ + trig_vals_[j][r + rr][1];
+        if (outer_x >= 0 && outer_x < width && outer_y >= 0 && outer_y < height &&
+            inner_x >= 0 && inner_x < width && inner_y >= 0 && inner_y < height) {
+          int outer_val = (int) raw_bin_[outer_x][outer_y];
+          int inner_val = (int) raw_bin_[inner_x][inner_y];
+          if (outer_val < max_iris_point_intensity && inner_val < max_pupil_point_intensity)
+            point_response += (outer_val - inner_val);
+        }
+      }
+      if (point_response > best_radial_response) {
+        seg_best_r[j] = r;
+        best_radial_response = point_response;
+      }
+    }
+  }
+
+  int    num_angles_used  = 0;
+  double total_deviation  = 0.0;
+  for (int j = 0; j < 256; j++) {
+    dimless_r_[j] = 0.0;
+    if (seg_best_r[j] > 0) {
+      dimless_r_[j] = (double) seg_best_r[j] / (double) pupil_radius_;
+      total_deviation += std::abs(dimless_r_[j] - 1.0);
+      num_angles_used++;
+    }
+  }
+  if (num_angles_used > 0)
+    pupil_circularity_avg_deviation_ = total_deviation / (double) num_angles_used;
+}
+
 void MFilter::DownSize(uint8_t **raw_img, int width, int height, int downsize_scale, uint8_t **ds_img) {
   int ds_width = width / downsize_scale;
   int ds_height = height / downsize_scale;
-
   for (int i_x = 0; i_x < ds_width; i_x++) {
     int orig_x = i_x * downsize_scale;
-
     for (int i_y = 0; i_y < ds_height; i_y++) {
       int orig_y = i_y * downsize_scale;
-
       int ds_point = 0;
-      for (int j_x = 0; j_x < downsize_scale; j_x++) {
-        for (int j_y = 0; j_y < downsize_scale; j_y++) {
+      for (int j_x = 0; j_x < downsize_scale; j_x++)
+        for (int j_y = 0; j_y < downsize_scale; j_y++)
           ds_point += (int) raw_img[j_x + orig_x][j_y + orig_y];
-        }
-      }
-
       ds_img[i_x][i_y] = (uint8_t) (ds_point / (downsize_scale * downsize_scale));
     }
   }
@@ -2073,37 +2122,23 @@ void MFilter::EdgeMap(uint8_t **raw_img, int width, int height) {
     for (int k_x = 0; k_x < 4; k_x++) {
       edge_val_bin_[k_x][i_y] = 0;
       edge_val_bin_[width - 5 + k_x][i_y] = 0;
-
       pupil_edge_bin_[k_x][i_y] = 0;
       pupil_edge_bin_[width - 5 + k_x][i_y] = 0;
-
       edge_raw_bin_[k_x][i_y] = 0;
       edge_raw_bin_[width - 5 + k_x][i_y] = 0;
     }
-
     for (int i_x = 4; i_x < width - 4; i_x++) {
       edge_val_bin_[i_x][i_y] = 0;
       pupil_edge_bin_[i_x][i_y] = 0;
-
       for (int j_x = 0; j_x < 4; j_x++) {
         int img_pt_1 = (int) raw_img[i_x - j_x - 1][i_y];
-        if (img_pt_1 > 200) {
-          img_pt_1 = 200;
-        }
-
+        if (img_pt_1 > 200) img_pt_1 = 200;
         int img_pt_2 = (int) raw_img[i_x + j_x][i_y];
-        if (img_pt_2 > 200) {
-          img_pt_2 = 200;
-        }
-
+        if (img_pt_2 > 200) img_pt_2 = 200;
         edge_val_bin_[i_x][i_y] += img_pt_1 - img_pt_2;
       }
-      if (edge_val_bin_[i_x][i_y] < 0) {
-        edge_val_bin_[i_x][i_y] *= -1;
-      }
-      if (edge_val_bin_[i_x][i_y] > 140) {
-        edge_val_bin_[i_x][i_y] = 140;
-      }
+      if (edge_val_bin_[i_x][i_y] < 0) edge_val_bin_[i_x][i_y] *= -1;
+      if (edge_val_bin_[i_x][i_y] > 140) edge_val_bin_[i_x][i_y] = 140;
       edge_val_bin_[i_x][i_y] /= 3;
       edge_raw_bin_[i_x][i_y] = (uint8_t) edge_val_bin_[i_x][i_y];
     }
@@ -2116,22 +2151,13 @@ void MFilter::GetVertEdges(uint8_t **raw_img, int width, int height) {
       vert_edge_[i_x][k_y] = 0;
       vert_edge_[i_x][height - k_y - 1] = 0;
     }
-
     for (int j_y = 4; j_y < height - 8; j_y++) {
       int point_val = (int) raw_img[i_x][j_y - 2] + (int) raw_img[i_x][j_y - 1];
       point_val = point_val - (int) raw_img[i_x][j_y + 1] - (int) raw_img[i_x][j_y];
-      if (point_val < 0) {
-        point_val = -point_val;
-      }
-      if (point_val > 255) {
-        point_val = 255;
-      }
-
-      // Version 2.2.1 change
+      if (point_val < 0) point_val = -point_val;
+      if (point_val > 255) point_val = 255;
       vert_edge_[i_x][j_y] = (uint8_t) point_val;
-      if (point_val > 20) {
-        point_val = 20;
-      }
+      if (point_val > 20) point_val = 20;
       vert_edge_[i_x][j_y] = point_val;
     }
   }

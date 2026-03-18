@@ -10,146 +10,111 @@
 
 #include "BIQTIris.h"
 
-/**
- *  Creates a BIQTIris instance
- */
 BIQTIris::BIQTIris() {
-  // descriptor.json loading removed: BIQTIris is embedded directly,
-  // so no BIQT_HOME or external framework installation is required
-  mfo.Initialize();
+    mfo.Initialize();
 }
-
 /**
- * Evaluates the iris images.
+ * @brief Computes iris quality metrics from a grayscale image using
+ *        externally detected iris and pupil geometry.
  *
- * @param file the input file.
+ * Iris and pupil detection is not performed internally. The coordinates
+ * supplied in @p detectedIris are injected directly into all metric
+ * computations, allowing the caller to use their own detector.
  *
- * @return The result of the evaluation.
+ * Image requirements:
+ *   - Type:   CV_8UC1 (8-bit single-channel grayscale). The underlying
+ *             algorithm reads pixel data as a flat uint8_t array — passing
+ *             any other type will produce incorrect results.
+ *   - Size:   width 256–1000 px, height 256–680 px.
+ *   - Layout: continuous memory (isContinuous() == true).
+ *
+ * All computed scores are inserted into @p qualityScores with the prefix
+ * "irisBiqt". The primary composite score is stored under "irisBiqtQuality".
+ * Uses insert() — existing keys are not overwritten, so pass a fresh map
+ * for each frame.
+ *
+ * @param image          8-bpp grayscale image as a cv::Mat.
+ * @param detectedIris   Externally computed iris/pupil centre and radius.
+ * @param qualityScores  Output map; 32 scores are inserted on success.
+ *                       Must not be nullptr.
+ * @return  0 on success.
+ *          1 if the image is empty, not CV_8UC1, not continuous,
+ *            or smaller than 256x256 px.
+ *          2 if the image exceeds 1000x680 px.
+ *          3 if an unexpected exception occurred.
  */
-Provider::EvaluationResult BIQTIris::evaluate(const std::string &file) {
-  // Initialize some variables
-  Provider::EvaluationResult eval_result;
-  Provider::QualityResult quality_result;
-  try {
-    // Read the image
-    cv::Mat img = cv::imread(file, cv::IMREAD_GRAYSCALE);
-    uint8_t *raw_img = img.data;
-
-    if (img.rows == 0 || img.cols == 0 || img.data == nullptr || !img.isContinuous()) {
-      std::cerr << "Error when attempting to read '" << file << "' "
-                << std::endl;
-      eval_result.errorCode = 1;
-      return eval_result;
+int32_t BIQTIris::assessQuality(const cv::Mat &image,
+                                const DetectedIris &detectedIris,
+                                std::map<std::string, float> *qualityScores) {
+    if (image.empty() || image.data == nullptr || !image.isContinuous()) {
+        std::cerr << "BIQTIris::assessQuality: image is empty or not continuous" << std::endl;
+        return 1;
+    }
+    if (image.type() != CV_8UC1) {
+        std::cerr << "BIQTIris::assessQuality: image must be CV_8UC1 (8-bit grayscale)" << std::endl;
+        return 1;
+    }
+    if (image.cols < mfo.min_width_ || image.rows < mfo.min_height_) {
+        std::cerr << "BIQTIris::assessQuality: image is too small ("
+                  << image.cols << "x" << image.rows << ")" << std::endl;
+        return 1;
+    }
+    if (image.cols > mfo.max_width_ || image.rows > mfo.max_height_) {
+        std::cerr << "BIQTIris::assessQuality: image is too large ("
+                  << image.cols << "x" << image.rows << ")" << std::endl;
+        return 2;
     }
 
-    if (img.cols < mfo.min_width_ || img.rows < mfo.min_height_) {
-      // March 2023 minor revisions
-	  // Changed from if (img.rows < mfo.min_width_ || img.cols < mfo.min_height_) 
-      // BIQT Iris has been observed to segfault on images that are very small. This block is intended
-      // to prevent that.
-      std::cerr << "File '" << file << "' is too small to process ("
-                << img.cols << "x" << img.rows << ")." << std::endl;
-      eval_result.errorCode = 1;
-      return eval_result;
+    try {
+        const uint8_t *frameBytes = image.data;
+        const int width  = image.cols;
+        const int height = image.rows;
+
+        double biqtQuality = mfo.GetQualityFromImageFrame(
+            frameBytes, width, height,
+            detectedIris.irisX, detectedIris.irisY, detectedIris.irisRadius,
+            detectedIris.pupilX, detectedIris.pupilY, detectedIris.pupilRadius);
+
+        qualityScores->insert({"irisBiqtQuality", static_cast<float>(biqtQuality)});
+
+        qualityScores->insert({"irisBiqtIsoOverallQuality", static_cast<float>(mfo.GetIsoOverallQuality())});
+
+        qualityScores->insert({"irisBiqtContrast", static_cast<float>(mfo.GetContrastScore())});
+        qualityScores->insert({"irisBiqtSharpness", static_cast<float>(mfo.GetDefocusScore())});
+        qualityScores->insert({"irisBiqtIrisScleraGs", static_cast<float>(mfo.GetISGSDiffMeanAvg())});
+        qualityScores->insert({"irisBiqtIrisPupilGs", static_cast<float>(mfo.GetIrisPupilGSDiff())});
+        qualityScores->insert({"irisBiqtPupilCircularityAvgDeviation", static_cast<float>(mfo.GetPupilCircularityDeviationAvg())});
+
+        qualityScores->insert({"irisBiqtNormalizedContrast", static_cast<float>(mfo.GetNContrast())});
+        qualityScores->insert({"irisBiqtNormalizedSharpness", static_cast<float>(mfo.GetNDefocus())});
+        qualityScores->insert({"irisBiqtNormalizedIrisDiameter", static_cast<float>(mfo.GetNIrisID())});
+        qualityScores->insert({"irisBiqtNormalizedIrisScleraGs", static_cast<float>(mfo.GetNISGSMean())});
+        qualityScores->insert({"irisBiqtNormalizedIrisPupilGs", static_cast<float>(mfo.GetNIPGSDiff())});
+        qualityScores->insert({"irisBiqtNormalizedIsoUsableIrisArea", static_cast<float>(mfo.GetNIrisVis())});
+
+        qualityScores->insert({"irisBiqtIsoUsableIrisArea", static_cast<float>(mfo.GetUsableIrisAreaPercent())});
+        qualityScores->insert({"irisBiqtIsoIrisScleraContrast", static_cast<float>(mfo.GetISOIrisScleraContrast())});
+        qualityScores->insert({"irisBiqtIsoIrisPupilContrast", static_cast<float>(mfo.GetISOIrisPupilContrast())});
+        qualityScores->insert({"irisBiqtIsoPupilBoundaryCircularity", static_cast<float>(mfo.GetISOPupilBoundaryCircularity())});
+        qualityScores->insert({"irisBiqtIsoGreyscaleUtilization", static_cast<float>(mfo.GetISOGreyscaleUtilization())});
+        qualityScores->insert({"irisBiqtIsoIrisPupilRatio", static_cast<float>(mfo.GetISOPIRatio())});
+        qualityScores->insert({"irisBiqtIsoIrisPupilConcentricity", static_cast<float>(mfo.GetISOIPConcentricity())});
+        qualityScores->insert({"irisBiqtIsoMarginAdequacy", static_cast<float>(mfo.GetISOMarginAdequacy())});
+        qualityScores->insert({"irisBiqtIsoSharpness", static_cast<float>(mfo.GetISOSharpness())});
+
+        qualityScores->insert({"irisBiqtNormalizedIsoSharpness", static_cast<float>(mfo.GetNormalizedISOSharpness())});
+        qualityScores->insert({"irisBiqtNormalizedIsoIrisPupilRatio", static_cast<float>(mfo.GetNormalizedISOPIRatio())});
+        qualityScores->insert({"irisBiqtNormalizedIsoIrisPupilContrast", static_cast<float>(mfo.GetNormalizedISOIrisPupilContrast())});
+        qualityScores->insert({"irisBiqtNormalizedIsoIrisScleraContrast", static_cast<float>(mfo.GetNormalizedISOIrisScleraContrast())});
+        qualityScores->insert({"irisBiqtNormalizedIsoMarginAdequacy", static_cast<float>(mfo.GetNormalizedISOMarginAdequacy())});
+        qualityScores->insert({"irisBiqtNormalizedIsoGreyscaleUtilization", static_cast<float>(mfo.GetNormalizedISOGreyscaleUtilization())});
+        qualityScores->insert({"irisBiqtNormalizedIsoIrisPupilConcentricity", static_cast<float>(mfo.GetNormalizedISOIPConcentricity())});
+        qualityScores->insert({"irisBiqtNormalizedIsoIrisDiameter", static_cast<float>(mfo.GetNormalizedISOIrisDiameter())});
+
+        return 0;
     }
-    if (img.cols > mfo.max_width_ || img.rows > mfo.max_height_) {
-      std::cerr << "File '" << file << "' is too large to process ("
-                << img.cols << "x" << img.rows << ")." << std::endl;
-      eval_result.errorCode = 2;
-      return eval_result;
+    catch (std::exception &ex) {
+        std::cerr << "BIQTIris::assessQuality exception: " << ex.what() << std::endl;
+        return 3;
     }
-
-    // Calculate quality scores
-    double overall_quality = mfo.GetQualityFromImageFrame(raw_img, img.cols, img.rows);
-
-    // Quality Attributes Map
-    quality_result.metrics["quality"] = overall_quality;
-    quality_result.metrics["contrast"] = mfo.GetContrastScore();
-    quality_result.metrics["sharpness"] = mfo.GetDefocusScore();
-
-    quality_result.metrics["iris_sclera_gs"] = mfo.GetISGSDiffMeanAvg();
-    quality_result.metrics["iris_pupil_gs"] = mfo.GetIrisPupilGSDiff();
-
-    quality_result.metrics["pupil_circularity_avg_deviation"] = mfo.GetPupilCircularityDeviationAvg();
-
-    // (Normalized) Quality Attributes Map
-    quality_result.metrics["normalized_contrast"] = mfo.GetNContrast();
-    quality_result.metrics["normalized_sharpness"] = mfo.GetNDefocus();
-
-    quality_result.metrics["normalized_iris_diameter"] = mfo.GetNIrisID();
-    quality_result.metrics["normalized_iris_sclera_gs"] = mfo.GetNISGSMean();
-    quality_result.metrics["normalized_iris_pupil_gs"] = mfo.GetNIPGSDiff();
-    quality_result.metrics["normalized_iso_usable_iris_area"] = mfo.GetNIrisVis();
-
-    // ISO Metrics Map
-    quality_result.metrics["iso_usable_iris_area"] = mfo.GetUsableIrisAreaPercent();
-    quality_result.metrics["iso_iris_sclera_contrast"] = mfo.GetISOIrisScleraContrast();
-    quality_result.metrics["iso_iris_pupil_contrast"] = mfo.GetISOIrisPupilContrast();
-    quality_result.metrics["iso_pupil_boundary_circularity"] = mfo.GetISOPupilBoundaryCircularity();
-    quality_result.metrics["iso_greyscale_utilization"] = mfo.GetISOGreyscaleUtilization();
-    quality_result.metrics["iso_iris_pupil_ratio"] = mfo.GetISOPIRatio();
-    quality_result.metrics["iso_iris_pupil_concentricity"] = mfo.GetISOIPConcentricity();
-    quality_result.metrics["iso_margin_adequacy"] = mfo.GetISOMarginAdequacy();
-    quality_result.metrics["iso_sharpness"] = mfo.GetISOSharpness();
-    // Normalized ISO Metrics Map
-    quality_result.metrics["normalized_iso_sharpness"] = mfo.GetNormalizedISOSharpness();
-    quality_result.metrics["normalized_iso_iris_pupil_ratio"] = mfo.GetNormalizedISOPIRatio();
-    quality_result.metrics["normalized_iso_iris_pupil_contrast"] = mfo.GetNormalizedISOIrisPupilContrast();
-    quality_result.metrics["normalized_iso_iris_sclera_contrast"] = mfo.GetNormalizedISOIrisScleraContrast();
-    quality_result.metrics["normalized_iso_margin_adequacy"] = mfo.GetNormalizedISOMarginAdequacy();
-    quality_result.metrics["normalized_iso_greyscale_utilization"] = mfo.GetNormalizedISOGreyscaleUtilization();
-    quality_result.metrics["normalized_iso_iris_pupil_concentricity"] = mfo.GetNormalizedISOIPConcentricity();
-    quality_result.metrics["normalized_iso_iris_diameter"] = mfo.GetNormalizedISOIrisDiameter();
-    // Overall ISO quality metric
-    quality_result.metrics["iso_overall_quality"] = mfo.GetIsoOverallQuality();
-
-    // Features Map
-    quality_result.features["image_width"] = img.cols;
-    quality_result.features["image_height"] = img.rows;
-    quality_result.features["iris_center_x"] = mfo.GetIrisCenterX();
-    quality_result.features["iris_center_y"] = mfo.GetIrisCenterY();
-    quality_result.features["iris_diameter"] = mfo.GetIrisRadius() * 2;
-    quality_result.features["pupil_center_x"] = mfo.GetPupilCenterX();
-    quality_result.features["pupil_center_y"] = mfo.GetPupilCenterY();
-    quality_result.features["pupil_diameter"] = mfo.GetPupilRadius() * 2;
-    quality_result.features["pupil_radius"] = mfo.GetPupilRadius();
-
-    // Concatenate certain metrics together (as a string) and put it in the eval_result.
-    std::string delim = ",";
-    std::string summary;
-    summary.append(file);
-    summary.append(delim);
-
-    std::size_t found = file.find_last_of("/\\");
-    summary.append(file.substr(found + 1)).append(delim);
-
-    std::string met_val = std::to_string(mfo.GetIrisCenterX());
-    summary.append(met_val).append(delim);
-
-    met_val = std::to_string(mfo.GetIrisCenterY());
-    summary.append(met_val).append(delim);
-
-    met_val = std::to_string(mfo.GetIrisRadius());
-    summary.append(met_val).append(delim);
-
-    met_val = std::to_string(mfo.GetPupilCenterX());
-    summary.append(met_val).append(delim);
-
-    met_val = std::to_string(mfo.GetPupilCenterY());
-    summary.append(met_val).append(delim);
-
-    met_val = std::to_string(mfo.GetPupilRadius());
-    summary.append(met_val);
-
-    eval_result.message = summary;
-    eval_result.errorCode = (overall_quality < 0) ? 1 : 0;
-    eval_result.qualityResult.push_back(std::move(quality_result));
-    return eval_result;
-  }
-  catch (std::exception &ex) {
-    std::cerr << "exception caught: " << ex.what() << std::endl;
-    std::cerr << "File '" << file << "' could not be read." << std::endl;
-    eval_result.errorCode = 3;
-    return eval_result;
-  }
 }

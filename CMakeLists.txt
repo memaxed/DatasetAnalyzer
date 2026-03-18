@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(datasetanalyzer VERSION 1.1.0 LANGUAGES CXX)
+project(irisqualityapi VERSION 2.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,15 +12,7 @@ else()
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-find_package(OpenCV REQUIRED core highgui)
-
-find_package(jsoncpp QUIET)
-if(NOT jsoncpp_FOUND)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(JSONCPP jsoncpp)
-    endif()
-endif()
+find_package(OpenCV REQUIRED core)
 
 set(BIQTIRIS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/biqt-iris")
 
@@ -39,80 +31,45 @@ else()
     )
 endif()
 
-add_library(irisquality
-    src/IrisAnalyzer.cpp
-    src/ResultFormatter.cpp
-    src/PathUtils.cpp
+add_library(irisqualityapi
     ${BIQTIRIS_SOURCES}
 )
 
-add_library(irisquality::irisquality ALIAS irisquality)
+add_library(irisqualityapi::irisqualityapi ALIAS irisqualityapi)
 
-target_include_directories(irisquality
+target_include_directories(irisqualityapi
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${BIQTIRIS_DIR}/include
         ${OpenCV_INCLUDE_DIRS}
 )
 
-target_link_libraries(irisquality
+target_link_libraries(irisqualityapi
     PUBLIC
         ${OpenCV_LIBS}
 )
 
-if(jsoncpp_FOUND)
-    target_link_libraries(irisquality PUBLIC jsoncpp_lib)
-elseif(JSONCPP_FOUND)
-    target_include_directories(irisquality PUBLIC ${JSONCPP_INCLUDE_DIRS})
-    target_link_libraries(irisquality PUBLIC ${JSONCPP_LIBRARIES})
-endif()
-
-target_compile_features(irisquality PUBLIC cxx_std_17)
-
-add_executable(datasetanalyzer
-    src/main.cpp
-)
-
-target_link_libraries(datasetanalyzer PRIVATE irisquality)
+target_compile_features(irisqualityapi PUBLIC cxx_std_17)
 
 if(NOT WIN32)
-    target_link_libraries(irisquality PUBLIC ${CMAKE_DL_LIBS})
+    target_link_libraries(irisqualityapi PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
-find_library(LIBPQ_LIB NAMES pq)
-if(LIBPQ_LIB)
-    target_link_libraries(irisquality PUBLIC ${LIBPQ_LIB})
-else()
-    message(STATUS "libpq not found — suppressing possible GDAL/PQ linker errors")
-    if(NOT MSVC)
-        target_link_options(irisquality PRIVATE -Wl,--allow-shlib-undefined)
-    endif()
-endif()
-
-install(TARGETS irisquality datasetanalyzer
-    RUNTIME DESTINATION bin
+install(TARGETS irisqualityapi
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
 
-message(STATUS "")
-message(STATUS "--- datasetanalyzer build configuration ---")
-message(STATUS "  Platform      : ${CMAKE_SYSTEM_NAME}")
-message(STATUS "  Compiler      : ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
-message(STATUS "  Install prefix: ${CMAKE_INSTALL_PREFIX}")
-message(STATUS "  OpenCV version: ${OpenCV_VERSION}")
-message(STATUS "")
-message(STATUS "  After building, run:")
-message(STATUS "    datasetanalyzer --path <image_or_dir>")
-message(STATUS "")
+install(FILES
+    include/IrisQualityAPI.h
+    include/DetectedIris.h
+    DESTINATION include/irisqualityapi
+)
 
-if(WIN32)
-    message(STATUS "  Windows build tips:")
-    message(STATUS "    - Recommended compiler: MSVC (Visual Studio 2019+) or MinGW-w64")
-    message(STATUS "    - Use vcpkg to install jsoncpp and OpenCV:")
-    message(STATUS "        vcpkg install jsoncpp opencv")
-    message(STATUS "    - Then pass:")
-    message(STATUS "        -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake")
-endif()
-
+message(STATUS "")
+message(STATUS "--- irisquality build configuration ---")
+message(STATUS "Platform: ${CMAKE_SYSTEM_NAME}")
+message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "Install prefix: ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "OpenCV version: ${OpenCV_VERSION}")
 message(STATUS "")

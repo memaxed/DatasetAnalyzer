@@ -1,4 +1,4 @@
-﻿// #######################################################################
+// #######################################################################
 // NOTICE
 //
 // This software (or technical data) was produced for the U.S. Government
@@ -40,6 +40,10 @@ class IMAGEOPS_EXPORT MFilter {
 
   // Main Functions
   int GetQualityFromImageFrame(const uint8_t *frame_bytes, int width, int height);
+
+  int GetQualityFromImageFrame(const uint8_t *frame_bytes, int width, int height,
+                               int iris_cx, int iris_cy, int iris_r,
+                               int pupil_cx, int pupil_cy, int pupil_r);
 
   // Quality Attributes
   int GetContrastScore();
@@ -135,6 +139,10 @@ class IMAGEOPS_EXPORT MFilter {
   void FindPupilCenter(int **edge_v, int width, int height, int iris_center_x,
                        int iris_center_y, int iris_diameter);
   void FindFinePupil(int rough_pupil_center_x, int rough_pupil_center_y, int width, int height);
+
+  void CalcIrisScleraGS(int width, int height);
+  void CalcIrisPupilGS(int width, int height);
+  void CalcPupilCircularity(int width, int height);
   void FindOcclusions(uint8_t **raw_img, int width, int height, int iris_center_x, int iris_center_y,
                       int iris_radius, int pupil_center_x, int pupil_center_y, int pupil_radius);
 
@@ -260,73 +268,39 @@ class IMAGEOPS_EXPORT MFilter {
 };
 
 inline int MFilter::GetContrastScore() { return contrast_score_; }
-
 inline int MFilter::GetDefocusScore() { return defocus_score_; }
-
 inline int MFilter::GetIrisRadius() { return iris_radius_; }
-
 inline double MFilter::GetISGSDiffMeanAvg() { return isgs_diff_mean_avg_; }
-
 inline double MFilter::GetIrisPupilGSDiff() { return iris_pupil_gs_diff_; }
-
 inline int MFilter::GetUsableIrisAreaPercent() { return usable_iris_area_percent_; }
-
 inline int MFilter::GetPupilRadius() { return pupil_radius_; }
-
 inline double MFilter::GetPupilCircularityDeviationAvg() { return pupil_circularity_avg_deviation_; }
-
 inline double MFilter::GetNContrast() { return n_contrast_; }
-
 inline double MFilter::GetNDefocus() { return n_defocus_; }
-
 inline double MFilter::GetNIrisID() { return n_iris_id_; }
-
 inline double MFilter::GetNISGSMean() { return n_isgs_mean_; }
-
 inline double MFilter::GetNIPGSDiff() { return n_ipgs_diff_; }
-
 inline double MFilter::GetNIrisVis() { return n_iris_vis_; }
-
 inline double MFilter::GetISOIrisScleraContrast() { return iso_iris_sclera_contrast_value_; }
-
 inline double MFilter::GetISOIrisPupilContrast() { return iso_iris_pupil_contrast_value_; }
-
 inline double MFilter::GetISOPupilBoundaryCircularity() { return iso_pupil_boundary_circularity_value_; }
-
 inline double MFilter::GetISOGreyscaleUtilization() { return iso_greyscale_value_; }
-
 inline double MFilter::GetISOPIRatio() { return ((double) pupil_rad_ / (double) iris_radius_) * 100.0; }
-
 inline double MFilter::GetISOIPConcentricity() { return iso_ip_concentricity_value_; }
-
 inline double MFilter::GetISOMarginAdequacy() { return iso_margin_adequacy_value_; }
-
 inline double MFilter::GetISOSharpness() { return iso_sharpness_value_; }
-
 inline double MFilter::GetNormalizedISOSharpness() { return n_iso_sharpness_value_; }
-
 inline double MFilter::GetNormalizedISOGreyscaleUtilization() { return n_iso_greyscale_value_; }
-
 inline double MFilter::GetNormalizedISOIPConcentricity() { return n_iso_ip_concentricity_value_; }
-
 inline double MFilter::GetNormalizedISOIrisDiameter() { return n_iso_iris_diameter_value_; }
-
 inline double MFilter::GetNormalizedISOIrisScleraContrast() { return n_iso_iris_sclera_contrast_value_; }
-
 inline double MFilter::GetNormalizedISOMarginAdequacy() { return n_iso_margin_adequacy_value_; }
-
 inline double MFilter::GetNormalizedISOIrisPupilContrast() { return n_iso_iris_pupil_contrast_value_; }
-
 inline double MFilter::GetNormalizedISOPIRatio() { return n_iso_iris_pupil_ratio_value_; }
-
 inline int MFilter::GetIsoOverallQuality() { return iso_overall_quality_; }
-
 inline int MFilter::GetIrisCenterX() { return iris_center_x_; }
-
 inline int MFilter::GetIrisCenterY() { return iris_center_y_; }
-
 inline int MFilter::GetPupilCenterX() { return pupil_center_x_; }
-
 inline int MFilter::GetPupilCenterY() { return pupil_center_y_; }
 
 /**

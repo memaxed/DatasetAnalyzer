@@ -4,31 +4,31 @@
  * @file IrisQualityAPI.h
  * @brief Public API for iris image quality assessment using the embedded BIQTIris engine.
  *
- * This is the only header you need to include. All functionality is exposed
- * through the QualityAPI namespace.
- *
- * Basic usage:
  * @code
  *   #include "IrisQualityAPI.h"
  *
  *   // Analyze a single image
- *   IrisResult result = QualityAPI::analyze("iris.png");
- *   std::cout << QualityAPI::qualityLabel(result);       // "GOOD"
- *   std::cout << QualityAPI::overallQuality(result);     // 83.0
+ *   cv::Mat frame = cv::imread("iris.png", cv::IMREAD_GRAYSCALE);
+ *   DetectedIris det = ...;
  *
- *   // Analyze a dataset and export
- *   auto results = QualityAPI::analyzeDirectory("./dataset", true);
- *   auto good    = QualityAPI::filterByQuality(results, 70.0);
- *   std::string csv = QualityAPI::toCSV(good);
+ *   std::map<std::string, float> scores;
+ *   int rc = QualityAPI::assess(frame, det, &scores);
+ * 
+ *   // You can use scores["metric"]  
+ *   if (rc == 0)
+ *       std::cout << "Quality: " << scores["irisBiqtQuality"] << "\n";
+ *
+ *   // Or use already implemented methods:
+ *   std::cout << "Label: " << QualityAPI::qualityLabel(scores) << "\n";
+ *   std::cout << "Sharpness: " << QualityAPI::isoSharpness(scores) << "\n";
  * @endcode
  */
 
-#include "IrisAnalyzer.h"
-#include "PathUtils.h"
-#include "ResultFormatter.h"
+#include "BIQTIris.h"
 
 #include <string>
 #include <vector>
+#include <map>
 #include <stdexcept>
 
 namespace QualityAPI {
@@ -40,70 +40,64 @@ namespace QualityAPI {
 /**
  * @brief Analyzes a single iris image.
  *
- * @param imagePath Path to a supported image file (PNG, JPG, BMP, TIFF).
- *                  Image must be 256x256–1000x680 px, 8bpp grayscale.
- * @return IrisResult containing quality metrics and geometry features.
- *         Check IrisResult::hasError() before accessing metrics.
+ * @param image        8-bpp grayscale cv::Mat (CV_8UC1, continuous memory).
+ *                     Size must be within 256x256 – 1000x680 px.
+ * @param detectedIris Externally computed iris/pupil centre and radius.
+ * @param scores       Output map; Must not be nullptr.
+ * @return  0 on success.
+ *          1 if the image is invalid, too small, not CV_8UC1, or not continuous.
+ *          2 if the image exceeds the maximum supported size.
+ *          3 if an unexpected exception occurred.
  *
  * @code
- *   IrisResult r = QualityAPI::analyze("subject_01_left.png");
- *   if (!r.hasError())
- *       std::cout << QualityAPI::overallQuality(r) << "\n";
+ *   std::map<std::string, float> scores;
+ *   int rc = QualityAPI::assess(frame, det, &scores);
+ *   if (rc == 0)
+ *       std::cout << scores["irisBiqtQuality"] << "\n";
  * @endcode
  */
-inline IrisResult analyze(const std::string& imagePath) {
-    IrisAnalyzer analyzer;
-    analyzer.initialize();
-    return analyzer.analyze(imagePath);
+inline int32_t assess(const cv::Mat& image,
+                  const DetectedIris& detectedIris,
+                  std::map<std::string, float>* scores) {
+    BIQTIris engine;
+    return engine.assessQuality(image, detectedIris, scores);
 }
 
 /**
- * @brief Analyzes all supported images in a directory.
+ * @brief Analyzes a batch of frames.
  *
- * @param dirPath   Path to a directory containing iris images.
- * @param recursive If true, subdirectories are scanned recursively.
- * @return Vector of IrisResult, one per image, sorted alphabetically by path.
+ * @param frames and @param detections must have the same length.
+ * Each result map in @param results receives scores for the corresponding frame.
  *
- * @code
- *   auto results = QualityAPI::analyzeDirectory("./dataset", true);
- *   for (const auto& r : results)
- *       std::cout << r.imagePath << ": " << QualityAPI::qualityLabel(r) << "\n";
- * @endcode
- */
-inline std::vector<IrisResult> analyzeDirectory(const std::string& dirPath,
-                                                 bool recursive = false) {
-    IrisAnalyzer analyzer;
-    analyzer.initialize();
-
-    std::vector<IrisResult> results;
-    for (const auto& path : PathUtils::collectImages(dirPath, recursive)) {
-        results.push_back(analyzer.analyze(path));
-    }
-    return results;
-}
-
-/**
- * @brief Analyzes an explicit list of image paths.
- *
- * Useful when you already have a pre-filtered or manually assembled file list.
- *
- * @param paths Vector of absolute or relative image file paths.
- * @return Vector of IrisResult in the same order as the input paths.
+ * @param frames     Vector of 8-bpp grayscale cv::Mat images.
+ * @param detections Vector of DetectedIris, one per frame.
+ * @param results    Output vector of score maps; will be resized to match
+ *                   frames.size(). Must not be nullptr.
+ * @return Vector of per-frame return codes (same semantics as assess()).
+ * @throws std::invalid_argument if frames.size() != detections.size().
  *
  * @code
- *   auto results = QualityAPI::analyzeAll({ "left.png", "right.png" });
+ *   std::vector<std::map<std::string, float>> results;
+ *   auto codes = QualityAPI::assessAll(frames, detections, &results);
  * @endcode
  */
-inline std::vector<IrisResult> analyzeAll(const std::vector<std::string>& paths) {
-    IrisAnalyzer analyzer;
-    analyzer.initialize();
-
-    std::vector<IrisResult> results;
-    results.reserve(paths.size());
-    for (const auto& path : paths) {
-        results.push_back(analyzer.analyze(path));
+inline std::vector<int> assessAll(const std::vector<cv::Mat>& frames,
+                                   const std::vector<DetectedIris>& detections,
+                                   std::vector<std::map<std::string, float>>* results) {
+    if (frames.size() != detections.size()) {
+        throw std::invalid_argument(
+            "QualityAPI::assessAll: frames and detections must have the same size.");
     }
-    return results;
+
+    results->resize(frames.size());
+    std::vector<int> codes;
+    codes.reserve(frames.size());
+
+    for (std::size_t i = 0; i < frames.size(); ++i) {
+        BIQTIris engine;
+        codes.push_back(engine.assessQuality(frames[i], detections[i], &(*results)[i]));
+    }
+    return codes;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,20 +108,22 @@ inline std::vector<IrisResult> analyzeAll(const std::vector<std::string>& paths)
  * @brief Returns the ISO overall quality score (0–100).
  *
  * The primary composite quality metric. Derived from all ISO sub-scores.
- * Higher is better. Returns -1.0 if unavailable.
+ * Higher is better. Returns -1.0f if unavailable.
  */
-inline double overallQuality(const IrisResult& r) {
-    return r.getMetric("iso_overall_quality");
+inline float overallQuality(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtIsoOverallQuality");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
  * @brief Returns the raw overall quality score (0–100).
  *
  * Non-ISO composite score computed directly by the BIQTIris algorithm,
- * before ISO normalization. Returns -1.0 if unavailable.
+ * before ISO normalization. Returns -1.0f if unavailable.
  */
-inline double rawQuality(const IrisResult& r) {
-    return r.getMetric("quality");
+inline float rawQuality(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtQuality");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,20 +134,22 @@ inline double rawQuality(const IrisResult& r) {
  * @brief Returns the ISO sharpness score (0–100).
  *
  * Measures focus/defocus of the iris texture. Low values indicate
- * motion blur or out-of-focus capture. Returns -1.0 if unavailable.
+ * motion blur or out-of-focus capture. Returns -1.0f if unavailable.
  */
-inline double isoSharpness(const IrisResult& r) {
-    return r.getMetric("iso_sharpness");
+inline float isoSharpness(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtIsoSharpness");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
  * @brief Returns the ISO usable iris area percentage (0–100).
  *
  * Fraction of the iris region not occluded by eyelids or eyelashes.
- * Low values indicate heavy occlusion. Returns -1.0 if unavailable.
+ * Low values indicate heavy occlusion. Returns -1.0f if unavailable.
  */
-inline double isoUsableIrisArea(const IrisResult& r) {
-    return r.getMetric("iso_usable_iris_area");
+inline float isoUsableIrisArea(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtIsoUsableIrisArea");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
@@ -159,10 +157,11 @@ inline double isoUsableIrisArea(const IrisResult& r) {
  *
  * Greyscale contrast between the iris and pupil regions.
  * Low values may indicate poor lighting or pigmentation issues.
- * Returns -1.0 if unavailable.
+ * Returns -1.0f if unavailable.
  */
-inline double isoIrisPupilContrast(const IrisResult& r) {
-    return r.getMetric("iso_iris_pupil_contrast");
+inline float isoIrisPupilContrast(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtIsoIrisPupilContrast");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
@@ -170,30 +169,33 @@ inline double isoIrisPupilContrast(const IrisResult& r) {
  *
  * Greyscale contrast between the iris and the sclera (white of the eye).
  * Low values indicate difficulty segmenting the iris boundary.
- * Returns -1.0 if unavailable.
+ * Returns -1.0f if unavailable.
  */
-inline double isoIrisScleraContrast(const IrisResult& r) {
-    return r.getMetric("iso_iris_sclera_contrast");
+inline float isoIrisScleraContrast(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtIsoIrisScleraContrast");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
  * @brief Returns the ISO iris-pupil ratio score (0–100).
  *
  * Ratio of pupil diameter to iris diameter. Extreme dilation or
- * constriction reduces this score. Returns -1.0 if unavailable.
+ * constriction reduces this score. Returns -1.0f if unavailable.
  */
-inline double isoIrisPupilRatio(const IrisResult& r) {
-    return r.getMetric("iso_iris_pupil_ratio");
+inline float isoIrisPupilRatio(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtIsoIrisPupilRatio");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
  * @brief Returns the ISO iris-pupil concentricity score (0–100).
  *
  * Measures how well the pupil center aligns with the iris center.
- * Low values indicate significant decentration. Returns -1.0 if unavailable.
+ * Low values indicate significant decentration. Returns -1.0f if unavailable.
  */
-inline double isoIrisPupilConcentricity(const IrisResult& r) {
-    return r.getMetric("iso_iris_pupil_concentricity");
+inline float isoIrisPupilConcentricity(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtIsoIrisPupilConcentricity");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
@@ -201,20 +203,22 @@ inline double isoIrisPupilConcentricity(const IrisResult& r) {
  *
  * Measures whether sufficient iris margin is visible around the pupil.
  * Low values indicate the iris is too close to the image border.
- * Returns -1.0 if unavailable.
+ * Returns -1.0f if unavailable.
  */
-inline double isoMarginAdequacy(const IrisResult& r) {
-    return r.getMetric("iso_margin_adequacy");
+inline float isoMarginAdequacy(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtIsoMarginAdequacy");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
  * @brief Returns the ISO greyscale utilization score (0–100).
  *
  * Measures how well the image uses the available greyscale dynamic range.
- * Low values indicate over- or under-exposure. Returns -1.0 if unavailable.
+ * Low values indicate over- or under-exposure. Returns -1.0f if unavailable.
  */
-inline double isoGreyscaleUtilization(const IrisResult& r) {
-    return r.getMetric("iso_greyscale_utilization");
+inline float isoGreyscaleUtilization(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtIsoGreyscaleUtilization");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
@@ -222,10 +226,11 @@ inline double isoGreyscaleUtilization(const IrisResult& r) {
  *
  * Measures how closely the pupil boundary approximates a circle.
  * Low values may indicate occlusion or segmentation errors.
- * Returns -1.0 if unavailable.
+ * Returns -1.0f if unavailable.
  */
-inline double isoPupilBoundaryCircularity(const IrisResult& r) {
-    return r.getMetric("iso_pupil_boundary_circularity");
+inline float isoPupilBoundaryCircularity(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtIsoPupilBoundaryCircularity");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -236,242 +241,143 @@ inline double isoPupilBoundaryCircularity(const IrisResult& r) {
  * @brief Returns the raw contrast score (integer range).
  *
  * Direct contrast measurement before ISO normalization.
- * Returns -1.0 if unavailable.
+ * Returns -1.0f if unavailable.
  */
-inline double contrast(const IrisResult& r) {
-    return r.getMetric("contrast");
+inline float contrast(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtContrast");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
  * @brief Returns the raw sharpness / defocus score (integer range).
  *
  * Direct defocus measurement before ISO normalization.
- * Returns -1.0 if unavailable.
+ * Returns -1.0f if unavailable.
  */
-inline double sharpness(const IrisResult& r) {
-    return r.getMetric("sharpness");
+inline float sharpness(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtSharpness");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
  * @brief Returns the raw iris-sclera greyscale difference mean (float).
  *
  * Average difference in greyscale intensity between iris and sclera segments.
- * Returns -1.0 if unavailable.
+ * Returns -1.0f if unavailable.
  */
-inline double irisScleraGS(const IrisResult& r) {
-    return r.getMetric("iris_sclera_gs");
+inline float irisScleraGS(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtIrisScleraGs");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
  * @brief Returns the raw iris-pupil greyscale difference (float).
  *
  * Greyscale intensity difference between the iris and pupil regions.
- * Returns -1.0 if unavailable.
+ * Returns -1.0f if unavailable.
  */
-inline double irisPupilGS(const IrisResult& r) {
-    return r.getMetric("iris_pupil_gs");
+inline float irisPupilGS(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtIrisPupilGs");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 /**
  * @brief Returns the average pupil circularity deviation (float).
  *
  * Mean deviation of the pupil boundary from a perfect circle, in pixels.
- * Returns -1.0 if unavailable.
+ * Returns -1.0f if unavailable.
  */
-inline double pupilCircularityAvgDeviation(const IrisResult& r) {
-    return r.getMetric("pupil_circularity_avg_deviation");
+inline float pupilCircularityAvgDeviation(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtPupilCircularityAvgDeviation");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 // ---------------------------------------------------------------------------
-// Normalized scores
+// Normalized scores (0.0–1.0)
 // ---------------------------------------------------------------------------
 
-/**
- * @brief Returns the normalized contrast score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedContrast(const IrisResult& r) {
-    return r.getMetric("normalized_contrast");
+/** @brief Returns the normalized contrast score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedContrast(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedContrast");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized sharpness score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedSharpness(const IrisResult& r) {
-    return r.getMetric("normalized_sharpness");
+/** @brief Returns the normalized sharpness score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedSharpness(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedSharpness");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized iris diameter score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedIrisDiameter(const IrisResult& r) {
-    return r.getMetric("normalized_iris_diameter");
+/** @brief Returns the normalized iris diameter score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedIrisDiameter(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedIrisDiameter");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized iris-sclera greyscale score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedIrisScleraGS(const IrisResult& r) {
-    return r.getMetric("normalized_iris_sclera_gs");
+/** @brief Returns the normalized iris-sclera greyscale score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedIrisScleraGS(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedIrisScleraGs");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized iris-pupil greyscale score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedIrisPupilGS(const IrisResult& r) {
-    return r.getMetric("normalized_iris_pupil_gs");
+/** @brief Returns the normalized iris-pupil greyscale score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedIrisPupilGS(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedIrisPupilGs");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized ISO usable iris area score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedIsoUsableIrisArea(const IrisResult& r) {
-    return r.getMetric("normalized_iso_usable_iris_area");
+/** @brief Returns the normalized ISO usable iris area score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedIsoUsableIrisArea(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedIsoUsableIrisArea");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized ISO sharpness score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedIsoSharpness(const IrisResult& r) {
-    return r.getMetric("normalized_iso_sharpness");
+/** @brief Returns the normalized ISO sharpness score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedIsoSharpness(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedIsoSharpness");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized ISO iris-pupil ratio score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedIsoIrisPupilRatio(const IrisResult& r) {
-    return r.getMetric("normalized_iso_iris_pupil_ratio");
+/** @brief Returns the normalized ISO iris-pupil ratio score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedIsoIrisPupilRatio(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedIsoIrisPupilRatio");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized ISO iris-pupil contrast score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedIsoIrisPupilContrast(const IrisResult& r) {
-    return r.getMetric("normalized_iso_iris_pupil_contrast");
+/** @brief Returns the normalized ISO iris-pupil contrast score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedIsoIrisPupilContrast(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedIsoIrisPupilContrast");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized ISO iris-sclera contrast score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedIsoIrisScleraContrast(const IrisResult& r) {
-    return r.getMetric("normalized_iso_iris_sclera_contrast");
+/** @brief Returns the normalized ISO iris-sclera contrast score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedIsoIrisScleraContrast(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedIsoIrisScleraContrast");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized ISO margin adequacy score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedIsoMarginAdequacy(const IrisResult& r) {
-    return r.getMetric("normalized_iso_margin_adequacy");
+/** @brief Returns the normalized ISO margin adequacy score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedIsoMarginAdequacy(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedIsoMarginAdequacy");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized ISO greyscale utilization score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedIsoGreyscaleUtilization(const IrisResult& r) {
-    return r.getMetric("normalized_iso_greyscale_utilization");
+/** @brief Returns the normalized ISO greyscale utilization score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedIsoGreyscaleUtilization(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedIsoGreyscaleUtilization");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized ISO iris-pupil concentricity score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedIsoIrisPupilConcentricity(const IrisResult& r) {
-    return r.getMetric("normalized_iso_iris_pupil_concentricity");
+/** @brief Returns the normalized ISO iris-pupil concentricity score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedIsoIrisPupilConcentricity(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedIsoIrisPupilConcentricity");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
-/**
- * @brief Returns the normalized ISO iris diameter score (0.0–1.0).
- * Returns -1.0 if unavailable.
- */
-inline double normalizedIsoIrisDiameter(const IrisResult& r) {
-    return r.getMetric("normalized_iso_iris_diameter");
-}
-
-// ---------------------------------------------------------------------------
-// Geometry features
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Returns the image width in pixels.
- * Returns -1.0 if unavailable.
- */
-inline double imageWidth(const IrisResult& r) {
-    return r.getFeature("image_width");
-}
-
-/**
- * @brief Returns the image height in pixels.
- * Returns -1.0 if unavailable.
- */
-inline double imageHeight(const IrisResult& r) {
-    return r.getFeature("image_height");
-}
-
-/**
- * @brief Returns the X coordinate of the iris center in pixels.
- * Returns -1.0 if unavailable.
- */
-inline double irisCenterX(const IrisResult& r) {
-    return r.getFeature("iris_center_x");
-}
-
-/**
- * @brief Returns the Y coordinate of the iris center in pixels.
- * Returns -1.0 if unavailable.
- */
-inline double irisCenterY(const IrisResult& r) {
-    return r.getFeature("iris_center_y");
-}
-
-/**
- * @brief Returns the iris diameter in pixels.
- * Returns -1.0 if unavailable.
- */
-inline double irisDiameter(const IrisResult& r) {
-    return r.getFeature("iris_diameter");
-}
-
-/**
- * @brief Returns the X coordinate of the pupil center in pixels.
- * Returns -1.0 if unavailable.
- */
-inline double pupilCenterX(const IrisResult& r) {
-    return r.getFeature("pupil_center_x");
-}
-
-/**
- * @brief Returns the Y coordinate of the pupil center in pixels.
- * Returns -1.0 if unavailable.
- */
-inline double pupilCenterY(const IrisResult& r) {
-    return r.getFeature("pupil_center_y");
-}
-
-/**
- * @brief Returns the pupil diameter in pixels.
- * Returns -1.0 if unavailable.
- */
-inline double pupilDiameter(const IrisResult& r) {
-    return r.getFeature("pupil_diameter");
-}
-
-/**
- * @brief Returns the pupil radius in pixels.
- * Returns -1.0 if unavailable.
- */
-inline double pupilRadius(const IrisResult& r) {
-    return r.getFeature("pupil_radius");
+/** @brief Returns the normalized ISO iris diameter score (0.0–1.0). Returns -1.0f if unavailable. */
+inline float normalizedIsoIrisDiameter(const std::map<std::string, float>& scores) {
+    auto it = scores.find("irisBiqtNormalizedIsoIrisDiameter");
+    return (it != scores.end()) ? it->second : -1.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -479,118 +385,41 @@ inline double pupilRadius(const IrisResult& r) {
 // ---------------------------------------------------------------------------
 
 /**
- * @brief Returns true if the image meets the minimum quality threshold.
+ * @brief Returns true if the scores meet the minimum quality threshold.
  *
- * @param r         The result to evaluate.
- * @param threshold Minimum acceptable iso_overall_quality (default: 40.0).
- * @return false if the result contains an error or quality is below threshold.
+ * @param scores    Score map produced by assess().
+ * @param threshold Minimum acceptable irisBiqtIsoOverallQuality (default: 40.0).
+ * @return          false if the map is empty or quality is below threshold.
  *
  * @code
- *   if (QualityAPI::isAcceptable(result, 70.0))
+ *   if (QualityAPI::isAcceptable(scores, 70.0f))
  *       std::cout << "Image is suitable for enrollment.\n";
  * @endcode
  */
-inline bool isAcceptable(const IrisResult& r, double threshold = 40.0) {
-    if (r.hasError()) return false;
-    return overallQuality(r) >= threshold;
+inline bool isAcceptable(const std::map<std::string, float>& scores,
+                          float threshold = 40.0f) {
+    return overallQuality(scores) >= threshold;
 }
 
 /**
- * @brief Returns a human-readable quality label for the result.
+ * @brief Returns a human-readable quality label for the scores.
  *
  * Thresholds:
- *   - "GOOD"     - iso_overall_quality >= 70
- *   - "MARGINAL" - iso_overall_quality >= 40
- *   - "POOR"     - iso_overall_quality <  40
- *   - "ERROR"    - processing failed
+ *   - "GOOD"     - irisBiqtIsoOverallQuality >= 70
+ *   - "MARGINAL" - irisBiqtIsoOverallQuality >= 40
+ *   - "POOR"     - irisBiqtIsoOverallQuality <  40
+ *   - "ERROR"    - score unavailable (assess() failed)
  *
  * @code
- *   std::cout << r.imagePath << ": " << QualityAPI::qualityLabel(r) << "\n";
+ *   std::cout << QualityAPI::qualityLabel(scores) << "\n";
  * @endcode
  */
-inline std::string qualityLabel(const IrisResult& r) {
-    if (r.hasError()) return "ERROR";
-    double q = overallQuality(r);
-    if (q >= 70) return "GOOD";
-    if (q >= 40) return "MARGINAL";
+inline std::string qualityLabel(const std::map<std::string, float>& scores) {
+    float q = overallQuality(scores);
+    if (q < 0.0f)  return "ERROR";
+    if (q >= 70.0f) return "GOOD";
+    if (q >= 40.0f) return "MARGINAL";
     return "POOR";
-}
-
-// ---------------------------------------------------------------------------
-// Filtering
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Filters out results that contain errors.
- *
- * @param results Input result vector.
- * @return New vector containing only successfully processed results.
- *
- * @code
- *   auto valid = QualityAPI::filterValid(results);
- *   std::cout << valid.size() << " images processed successfully.\n";
- * @endcode
- */
-inline std::vector<IrisResult> filterValid(const std::vector<IrisResult>& results) {
-    std::vector<IrisResult> out;
-    for (const auto& r : results) {
-        if (!r.hasError()) out.push_back(r);
-    }
-    return out;
-}
-
-/**
- * @brief Filters results by minimum overall quality threshold.
- *
- * @param results   Input result vector.
- * @param threshold Minimum iso_overall_quality to include (default: 40.0).
- * @return New vector containing only results that meet the threshold.
- *
- * @code
- *   auto enrollable = QualityAPI::filterByQuality(results, 70.0);
- * @endcode
- */
-inline std::vector<IrisResult> filterByQuality(const std::vector<IrisResult>& results,
-                                                double threshold = 40.0) {
-    std::vector<IrisResult> out;
-    for (const auto& r : results) {
-        if (isAcceptable(r, threshold)) out.push_back(r);
-    }
-    return out;
-}
-
-// ---------------------------------------------------------------------------
-// Serialization
-// ---------------------------------------------------------------------------
-
-/**
- * @brief Formats results as a human-readable console table.
- *
- * Includes all ISO metrics, raw scores, normalized scores, and geometry.
- * Best suited for interactive use or debugging.
- */
-inline std::string toTable(const std::vector<IrisResult>& results) {
-    return ResultFormatter::format(results, "table");
-}
-
-/**
- * @brief Formats results as CSV.
- *
- * Columns: Provider, Image, Detection, AttributeType, Key, Value.
- * Suitable for importing into spreadsheets or analysis tools.
- */
-inline std::string toCSV(const std::vector<IrisResult>& results) {
-    return ResultFormatter::format(results, "csv");
-}
-
-/**
- * @brief Formats results as a JSON array.
- *
- * Each element contains "image", "metrics", and "features" fields.
- * Suitable for REST APIs or downstream processing.
- */
-inline std::string toJSON(const std::vector<IrisResult>& results) {
-    return ResultFormatter::format(results, "json");
 }
 
 }
